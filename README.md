@@ -3,9 +3,9 @@
 > **[中文化] llm-space**
 >
 > 此项目是 [deer-flow/llm-space](https://github.com/deer-flow/llm-space) 的中文翻译版本。
-> - 原项目 Stars: 0
-> - 主语言: 
-> - 许可证: 
+> - 原项目 Stars: 1828
+> - 主语言: TypeScript
+> - 许可证: MIT
 > - 翻译日期: 2026-09-08
 > - 原始 README: [README_en.md](README_en.md)
 >
