@@ -1,0 +1,839 @@
+import type {
+  ArkImageGenerationConfig,
+  AgentEvent,
+  AgentStreamRequest,
+  BuiltinTool,
+  BuiltinToolCallResponse,
+  CustomModel,
+  FileNode,
+  ModelConfig,
+  ModelProviderGroup,
+  NetworkSettings,
+  ProviderProfilePatch,
+  ProviderConnectionRef,
+  SearchSettings,
+  SystemProxyDetection,
+  Thread,
+  ThreadRunReference,
+  ThreadRunSnapshot,
+  ThreadSnapshot,
+  ThreadLocator,
+  ThreadStorageView,
+  PluginCommandView,
+  PluginCommandExecutionResult,
+  PluginCommandReport,
+  PluginCommandUserMessage,
+  PluginTool,
+  PluginView,
+  JsonObject,
+  JsonValue,
+} from "@llm-space/core";
+import type {
+  McpCallToolResponse,
+  McpServerDraft,
+  McpServerToolsResponse,
+  McpServerView,
+} from "@llm-space/core";
+import type { SkillContent, SkillInfo, SkillsSettings } from "@llm-space/core";
+import type {
+  CreateSubagentThreadInput,
+  CreateSubagentThreadResult,
+} from "@llm-space/core/thread";
+import type { RPCSchema } from "electrobun";
+
+import type { AnalyticsEvent, AnalyticsStatus } from "./analytics";
+import type { GithubAuthState } from "./auth";
+import type { Command } from "./commands";
+import type { FeatureReminder } from "./feature-reminders";
+import type {
+  RemoteDisconnectResult,
+  RemoteServerDraft,
+  RemoteServerStatusChangedPayload,
+  RemoteServerView,
+} from "./remote-servers";
+import type { RuntimeId, RuntimeScopedParams, RuntimeView } from "./runtime";
+import type { SharedImportStatusPayload } from "./shared-import";
+import type {
+  TraceConnectedProjectInput,
+  TraceImportFile,
+  TraceImportResult,
+  TraceLangfuseSearchInput,
+  TraceProject,
+  TraceRecord,
+  TraceRemoteTraceSummary,
+  TraceSyncResult,
+  TraceWorkbenchResponse,
+} from "./traces";
+import type { UpdateMode, UpdateStatusChangedPayload } from "./updates";
+
+/** A webview→bun request to start streaming an agent run. */
+export interface StreamThreadRequestPayload extends RuntimeScopedParams {
+  streamId: string;
+  request: AgentStreamRequest;
+  /** Per-tab connection choice; never persisted into the thread. */
+  connection?: ProviderConnectionRef;
+}
+
+/** A bun→webview chunk of a streaming agent run, keyed by `streamId`. */
+export type StreamThreadResponsePayload =
+  | { streamId: string; type: "event"; event: AgentEvent }
+  | { streamId: string; type: "done" }
+  | { streamId: string; type: "error"; message: string };
+
+/** A webview→bun request to abort an in-flight stream. */
+export interface AbortStreamThreadPayload extends RuntimeScopedParams {
+  streamId: string;
+}
+
+export type PluginCommandExecutionEvent =
+  | {
+      executionId: string;
+      commandId: string;
+      type: "status";
+      status: "running" | "succeeded" | "failed";
+      userMessage?: PluginCommandUserMessage;
+    }
+  | {
+      executionId: string;
+      commandId: string;
+      type: "phase";
+      report: PluginCommandReport;
+    };
+
+export interface DesktopRPCType {
+  bun: RPCSchema<{
+    requests: {
+      listRuntimes: {
+        params: Record<string, never>;
+        response: RuntimeView[];
+      };
+      getDefaultRuntime: {
+        params: Record<string, never>;
+        response: { runtimeId: RuntimeId };
+      };
+      remoteListServers: {
+        params: Record<string, never>;
+        response: RemoteServerView[];
+      };
+      remoteAddServer: {
+        params: { server: RemoteServerDraft };
+        response: RemoteServerView[];
+      };
+      remoteUpdateServer: {
+        params: { serverId: string; server: RemoteServerDraft };
+        response: RemoteServerView[];
+      };
+      remoteRemoveServer: {
+        params: { serverId: string };
+        response: RemoteServerView[];
+      };
+      remoteConnectServer: {
+        params: { serverId: string };
+        response: RemoteServerView[];
+      };
+      remoteTrustServerHostKey: {
+        params: { serverId: string; requestId: string };
+        response: RemoteServerView[];
+      };
+      remoteRejectServerHostKey: {
+        params: { serverId: string; requestId: string };
+        response: RemoteServerView[];
+      };
+      remoteDisconnectServer: {
+        params: { serverId: string };
+        response: RemoteDisconnectResult;
+      };
+      remoteSetDefaultRuntime: {
+        params: { runtimeId: RuntimeId };
+        response: RemoteServerView[];
+      };
+      remoteGetDefaultRuntime: {
+        params: Record<string, never>;
+        response: { runtimeId: RuntimeId };
+      };
+
+      availableModels: {
+        params: RuntimeScopedParams;
+        response: ModelProviderGroup[];
+      };
+      removeProvider: {
+        params: RuntimeScopedParams & { providerId: string };
+        response: ModelProviderGroup[];
+      };
+      // The builtin providers shipped with the app, each flagged with whether an
+      // API key was auto-detected in the environment.
+      builtinProviders: {
+        params: RuntimeScopedParams;
+        response: ModelProviderGroup[];
+      };
+      addProvider: {
+        params: RuntimeScopedParams & { providerId: string };
+        response: ModelProviderGroup[];
+      };
+      addCustomProvider: {
+        params: RuntimeScopedParams & {
+          id: string;
+          name: string;
+          baseUrl: string;
+          api?:
+            "anthropic-messages" | "openai-completions" | "openai-responses";
+        };
+        response: ModelProviderGroup[];
+      };
+      addProviderProfile: {
+        params: RuntimeScopedParams & { providerId: string };
+        response: ModelProviderGroup[];
+      };
+      updateProviderProfile: {
+        params: RuntimeScopedParams & {
+          providerId: string;
+          profileId: string;
+        } & ProviderProfilePatch;
+        response: ModelProviderGroup[];
+      };
+      removeProviderProfile: {
+        params: RuntimeScopedParams & {
+          providerId: string;
+          profileId: string;
+        };
+        response: ModelProviderGroup[];
+      };
+      updateProvider: {
+        params: RuntimeScopedParams & {
+          providerId: string;
+          name?: string | null;
+          api?:
+            | "anthropic-messages"
+            | "openai-completions"
+            | "openai-responses"
+            | null;
+          icon?: string | null;
+          imageGeneration?: ArkImageGenerationConfig;
+        };
+        response: ModelProviderGroup[];
+      };
+      setModelEnabled: {
+        params: RuntimeScopedParams & {
+          providerId: string;
+          modelId: string;
+          enabled: boolean;
+        };
+        response: ModelProviderGroup[];
+      };
+      setAllModelsEnabled: {
+        params: RuntimeScopedParams & { providerId: string; enabled: boolean };
+        response: ModelProviderGroup[];
+      };
+      // The user's chosen default model, or `null` for automatic (first
+      // available). Threads with no saved model — or a stale reference — resolve
+      // through it.
+      getDefaultModel: {
+        params: RuntimeScopedParams;
+        response: ModelConfig | null;
+      };
+      setDefaultModel: {
+        params: RuntimeScopedParams & { model: ModelConfig | null };
+        response: ModelConfig | null;
+      };
+      // `candidate` (from the editor dialog) tests an unsaved model config
+      // as-is; its `id` overrides `modelId`.
+      testModelConnection: {
+        params: RuntimeScopedParams & {
+          providerId: string;
+          profileId?: string;
+          modelId: string;
+          candidate?: CustomModel;
+        };
+        response: null;
+      };
+      removeCustomModel: {
+        params: RuntimeScopedParams & { providerId: string; modelId: string };
+        response: ModelProviderGroup[];
+      };
+      // Create or edit a custom model. `originalId` (present on edits) names the
+      // model being replaced, supporting a rename.
+      upsertCustomModel: {
+        params: RuntimeScopedParams & {
+          providerId: string;
+          model: CustomModel;
+          originalId?: string;
+        };
+        response: ModelProviderGroup[];
+      };
+      toggleMaximized: {
+        params: Record<string, never>;
+        response: { maximized: boolean };
+      };
+      isFullScreen: {
+        params: Record<string, never>;
+        response: { fullScreen: boolean };
+      };
+      localStorageGet: {
+        params: Record<string, never>;
+        response: {
+          initialized: boolean;
+          values: Record<string, string>;
+        };
+      };
+      localStorageInitialize: {
+        params: { values: Record<string, string> };
+        response: {
+          initialized: boolean;
+          values: Record<string, string>;
+        };
+      };
+      localStorageSet: {
+        params: { key: string; value: string };
+        response: null;
+      };
+      localStorageRemove: {
+        params: { key: string };
+        response: null;
+      };
+      // Resolve a directory under the llm-space root, creating it (recursively)
+      // if missing, and return its absolute path. The renderer can't touch the
+      // filesystem or read the root itself.
+      ensureRootDir: {
+        params: { relativePath: string };
+        response: { path: string };
+      };
+      // Local filesystem / thread storage, mirroring the web `/api/fs/local/*`
+      // routes. Void operations resolve to `null`.
+      fsLs: {
+        params: RuntimeScopedParams & { path: string };
+        response: FileNode[];
+      };
+      fsMkdir: {
+        params: RuntimeScopedParams & { path: string };
+        response: null;
+      };
+      fsCp: {
+        params: RuntimeScopedParams & { src: string; dest: string };
+        response: null;
+      };
+      fsMv: {
+        params: RuntimeScopedParams & { src: string; dest: string };
+        response: null;
+      };
+      fsRm: { params: RuntimeScopedParams & { path: string }; response: null };
+      fsRead: {
+        params: RuntimeScopedParams & { path: string };
+        response: Thread;
+      };
+      fsWrite: {
+        params: RuntimeScopedParams & { path: string; thread: Thread };
+        response: null;
+      };
+      fsArchiveRun: {
+        params: RuntimeScopedParams & {
+          path: string;
+          run: ThreadRunSnapshot & { id: string };
+        };
+        response: ThreadRunReference;
+      };
+      fsReadRunSnapshot: {
+        params: RuntimeScopedParams & { path: string; snapshotRef: string };
+        response: ThreadSnapshot;
+      };
+      pluginsList: {
+        params: Record<string, never>;
+        response: PluginView[];
+      };
+      pluginsRefresh: {
+        params: Record<string, never>;
+        response: PluginView[];
+      };
+      pluginsInstallZip: {
+        params: { fileName: string; dataBase64: string };
+        response: {
+          pluginId: string;
+          version: string;
+          path: string;
+          plugins: PluginView[];
+        };
+      };
+      pluginsReload: {
+        params: { pluginId: string };
+        response: PluginView[];
+      };
+      pluginsUninstall: {
+        params: { pluginId: string };
+        response: PluginView[];
+      };
+      pluginsSetEnabled: {
+        params: { pluginId: string; enabled: boolean };
+        response: PluginView[];
+      };
+      pluginsSetSettings: {
+        params: { pluginId: string; settings: JsonObject };
+        response: PluginView[];
+      };
+      pluginCommandsList: {
+        params: Record<string, never>;
+        response: PluginCommandView[];
+      };
+      pluginCommandExecute: {
+        params: {
+          executionId: string;
+          commandId: string;
+          arguments: string[];
+          activeTab: { filename: string; thread: Thread } | null;
+        };
+        response: PluginCommandExecutionResult;
+      };
+      pluginToolsList: {
+        params: Record<string, never>;
+        response: PluginTool[];
+      };
+      pluginToolExecute: {
+        params: {
+          tool: PluginTool;
+          thread: Thread;
+          variables: Record<string, JsonValue>;
+          arguments: Record<string, unknown>;
+        };
+        response: BuiltinToolCallResponse;
+      };
+      threadStoragesList: {
+        params: Record<string, never>;
+        response: ThreadStorageView[];
+      };
+      threadStorageResolveLatest: {
+        params: { storageId: string; resourceId: string };
+        response: ThreadLocator;
+      };
+      threadStorageRead: {
+        params: { storageId: string; locator: ThreadLocator };
+        response: Thread;
+      };
+      threadStorageWrite: {
+        params: { storageId: string; thread: Thread; resourceId?: string };
+        response: ThreadLocator;
+      };
+      // Publish a workspace thread as a shareable link: read the thread from
+      // disk, create a secret GitHub Gist (requires GitHub sign-in), and return
+      // the web viewer URL + gist id. `title`/`description` override the shared
+      // copy's display metadata (the gist description drives the viewer's
+      // description). Throws when signed out or the gist API fails; the renderer
+      // maps the error to friendly copy.
+      shareThread: {
+        params: {
+          runtimeId: RuntimeId;
+          path: string;
+          title?: string;
+          description?: string;
+        };
+        response: { shareUrl: string; gistId: string };
+      };
+      // Open an absolute directory itself, or reveal an absolute file selected
+      // in Finder/Explorer. A leading `~` is expanded. Internal skills use
+      // `llm-space://internal/skills/<name>`. Missing/invalid targets reject.
+      fsReveal: { params: { path: string }; response: null };
+      // Resolve a workspace-relative path to its absolute on-disk path.
+      fsRealpath: {
+        params: RuntimeScopedParams & { path: string };
+        response: { path: string };
+      };
+      // Read an arbitrary text file (NOT confined to the workspace) for the
+      // prompt `@include` macro. A leading `~` expands to the user's home.
+      // Returns "" for a missing/unreadable path so includes degrade quietly.
+      fsReadText: {
+        params: { runtimeId: RuntimeId; path: string };
+        response: { text: string };
+      };
+      // Whether a path points to a readable regular file for template
+      // `exists(path)` conditions. A leading `~` expands to the user's home.
+      fsTextFileExists: {
+        params: { runtimeId: RuntimeId; path: string };
+        response: { exists: boolean };
+      };
+      // Whether a path points to an existing directory. A leading `~` expands
+      // to the user's home.
+      fsDirectoryExists: {
+        params: { path: string };
+        response: { exists: boolean };
+      };
+      // Expand a user-authored path (including a leading `~`) and return its
+      // absolute form without requiring it to exist.
+      fsResolveUserPath: {
+        params: { path: string };
+        response: { path: string };
+      };
+      // Open the native file picker (for a "file content" prompt variable).
+      // `path` is null when the user cancels.
+      fsPickFile: {
+        params: Record<string, never>;
+        response: { path: string | null };
+      };
+      // Open the native directory picker for a working-directory variable.
+      // `path` is null when the user cancels.
+      fsPickDirectory: {
+        params: Record<string, never>;
+        response: { path: string | null };
+      };
+      // --- Code generator (export the thread as a runnable project) ---
+      // Open the native folder picker for the project's PARENT directory. The
+      // wizard combines it with the project name; `path` is null on cancel.
+      generatorPickDirectory: {
+        params: Record<string, never>;
+        response: { path: string | null };
+      };
+      // Resolve `parentDir/projectName`, validate it can hold a fresh project,
+      // create it, and authorize it (bun-side) for the generator's writes +
+      // `uv` runs. The wizard's "Next" gate on the directory step.
+      generatorPrepareDirectory: {
+        params: { parentDir: string; projectName: string };
+        response: { ok: true; dir: string } | { ok: false; error: string };
+      };
+      // Whether `uv` is installed on the host (+ version), so the renderer can
+      // prompt to install it or fall back to instructions in PLAN.md.
+      generatorCheckUv: {
+        params: Record<string, never>;
+        response: { installed: boolean; version?: string };
+      };
+      // Run `uv <args>` with cwd = an authorized project directory. Only `uv`
+      // can ever be spawned; `rootDir` must have been authorized via
+      // `generatorPickDirectory`. Returns the raw exit code + output.
+      generatorRunUv: {
+        params: { rootDir: string; args: string[]; timeoutMs?: number };
+        response: {
+          code: number;
+          stdout: string;
+          stderr: string;
+          timedOut: boolean;
+        };
+      };
+      // Write a UTF-8 file under an authorized project directory. Rejects path
+      // traversal outside `rootDir`.
+      generatorWriteFile: {
+        params: { rootDir: string; relativePath: string; contents: string };
+        response: null;
+      };
+      // Delete a file under an authorized project directory; no-op when missing.
+      generatorRemoveFile: {
+        params: { rootDir: string; relativePath: string };
+        response: null;
+      };
+      // On macOS, open Terminal in an authorized generated project and run
+      // `make dev`. Returns false on unsupported platforms.
+      generatorOpenDevTerminal: {
+        params: { rootDir: string };
+        response: boolean;
+      };
+      // Resolve real secret values for a generated `.env`: the runtime's model
+      // provider API key plus the raw values of named environment variables. Used
+      // only after explicit user opt-in to materialize secrets to disk.
+      generatorResolveEnv: {
+        params: RuntimeScopedParams & {
+          providerId: string;
+          profileId?: string;
+          envNames: string[];
+        };
+        response: { modelApiKey: string; envValues: Record<string, string> };
+      };
+      mcpListServers: {
+        params: RuntimeScopedParams;
+        response: McpServerView[];
+      };
+      mcpAddServer: {
+        params: RuntimeScopedParams & { server: McpServerDraft };
+        response: McpServerView[];
+      };
+      mcpUpdateServer: {
+        params: RuntimeScopedParams & {
+          serverId: string;
+          server: McpServerDraft;
+        };
+        response: McpServerView[];
+      };
+      mcpRemoveServer: {
+        params: RuntimeScopedParams & { serverId: string };
+        response: McpServerView[];
+      };
+      mcpDisconnectServer: {
+        params: RuntimeScopedParams & { serverId: string };
+        response: McpServerView[];
+      };
+      mcpCancelTest: {
+        params: RuntimeScopedParams & { serverId: string };
+        response: McpServerView[];
+      };
+      mcpListTools: {
+        params: RuntimeScopedParams & { serverId: string };
+        response: McpServerToolsResponse;
+      };
+      mcpCallTool: {
+        params: RuntimeScopedParams & {
+          serverId: string;
+          toolName: string;
+          arguments: Record<string, unknown>;
+        };
+        response: McpCallToolResponse;
+      };
+      createSubagentThread: {
+        params: RuntimeScopedParams & CreateSubagentThreadInput;
+        response: CreateSubagentThreadResult;
+      };
+      builtInListTools: {
+        params: RuntimeScopedParams;
+        response: BuiltinTool[];
+      };
+      builtInCallTool: {
+        params: RuntimeScopedParams & {
+          name: string;
+          arguments: Record<string, unknown>;
+          config?: Record<string, unknown>;
+          connection?: ProviderConnectionRef;
+        };
+        response: BuiltinToolCallResponse;
+      };
+      // The user's anonymous-analytics opt-out preference plus whether the
+      // hard gates allow sending at all (see `shared/analytics.ts`).
+      getAnalyticsSettings: {
+        params: Record<string, never>;
+        response: AnalyticsStatus;
+      };
+      setAnalyticsSettings: {
+        params: { enabled: boolean };
+        response: AnalyticsStatus;
+      };
+      // The search provider + API keys backing the built-in web tools.
+      getSearchSettings: {
+        params: RuntimeScopedParams;
+        response: SearchSettings;
+      };
+      setSearchSettings: {
+        params: RuntimeScopedParams & { settings: SearchSettings };
+        response: SearchSettings;
+      };
+      // The proxy config governing the Bun process's outbound HTTP egress.
+      getNetworkSettings: {
+        params: RuntimeScopedParams;
+        response: NetworkSettings;
+      };
+      setNetworkSettings: {
+        params: RuntimeScopedParams & { settings: NetworkSettings };
+        response: NetworkSettings;
+      };
+      detectSystemProxy: {
+        params: RuntimeScopedParams;
+        response: SystemProxyDetection;
+      };
+      // The discovery folders + hidden skills backing the built-in Skill tool.
+      skillsGetSettings: {
+        params: RuntimeScopedParams;
+        response: SkillsSettings;
+      };
+      // Open the native folder picker; `path` is null when the user cancels.
+      skillsBrowseForPath: {
+        params: Record<string, never>;
+        response: { path: string | null };
+      };
+      skillsAddPath: {
+        params: RuntimeScopedParams & { path: string };
+        response: SkillsSettings;
+      };
+      skillsRemovePath: {
+        params: RuntimeScopedParams & { path: string };
+        response: SkillsSettings;
+      };
+      skillsSetSkillHidden: {
+        params: RuntimeScopedParams & {
+          path: string;
+          skillName: string;
+          hidden: boolean;
+        };
+        response: SkillsSettings;
+      };
+      skillsSetPluginSkillHidden: {
+        params: RuntimeScopedParams & {
+          pluginId: string;
+          skillName: string;
+          hidden: boolean;
+        };
+        response: SkillsSettings;
+      };
+      skillsSetAllPluginSkillsHidden: {
+        params: RuntimeScopedParams & {
+          pluginId: string;
+          hidden: boolean;
+        };
+        response: SkillsSettings;
+      };
+      // Enable/disable every skill in one folder at once.
+      skillsSetAllSkillsHidden: {
+        params: RuntimeScopedParams & { path: string; hidden: boolean };
+        response: SkillsSettings;
+      };
+      // List every enabled, conflict-free skill available to agents.
+      skillsListAvailable: {
+        params: RuntimeScopedParams;
+        response: SkillInfo[];
+      };
+      // List all Skills from active Plugins, including individually disabled ones.
+      skillsListPluginSkills: {
+        params: RuntimeScopedParams;
+        response: SkillInfo[];
+      };
+      // Discover the skills under one folder (name/description/path/enabled).
+      skillsListSkills: {
+        params: RuntimeScopedParams & { path: string };
+        response: SkillInfo[];
+      };
+      // Read one skill's full SKILL.md (frontmatters + body) by its directory.
+      skillsReadSkill: {
+        params: RuntimeScopedParams & { path: string };
+        response: SkillContent;
+      };
+      // List trace projects for the dedicated Trace Panel.
+      traceListProjects: {
+        params: RuntimeScopedParams;
+        response: TraceProject[];
+      };
+      // Create a manual Langfuse trace project under `traces/projects`.
+      traceCreateProject: {
+        params: RuntimeScopedParams & { name: string };
+        response: TraceProject;
+      };
+      // Create a connected Langfuse project after validating credentials.
+      traceCreateConnectedProject: {
+        params: RuntimeScopedParams & TraceConnectedProjectInput;
+        response: TraceProject;
+      };
+      // List trace summaries for one trace project.
+      traceListTraces: {
+        params: RuntimeScopedParams & { projectId: string };
+        response: TraceRecord[];
+      };
+      // Import renderer-read Langfuse JSON files into one trace project.
+      traceImportLangfuseJson: {
+        params: RuntimeScopedParams & {
+          projectId: string;
+          files: TraceImportFile[];
+        };
+        response: TraceImportResult;
+      };
+      // Search a bounded remote Langfuse trace list for explicit user sync.
+      traceSearchLangfuseTraces: {
+        params: RuntimeScopedParams & {
+          projectId: string;
+          filters?: TraceLangfuseSearchInput;
+        };
+        response: TraceRemoteTraceSummary[];
+      };
+      // Sync selected remote Langfuse trace ids into local trace storage.
+      traceSyncLangfuseTraces: {
+        params: RuntimeScopedParams & { projectId: string; traceIds: string[] };
+        response: TraceSyncResult;
+      };
+      // Read a trace summary by key without creating a workbench.
+      traceReadTrace: {
+        params: RuntimeScopedParams & { projectId: string; traceKey: string };
+        response: TraceRecord;
+      };
+      // Read or lazily create the editable ThreadPlayground workbench.
+      traceReadOrCreateWorkbench: {
+        params: RuntimeScopedParams & { projectId: string; traceKey: string };
+        response: TraceWorkbenchResponse;
+      };
+      // Rename a trace summary and keep its editable workbench title in sync.
+      traceUpdateTraceTitle: {
+        params: RuntimeScopedParams & {
+          projectId: string;
+          traceKey: string;
+          title: string;
+        };
+        response: TraceWorkbenchResponse;
+      };
+      // Persist a trace workbench thread; raw trace data remains immutable.
+      traceWriteWorkbench: {
+        params: RuntimeScopedParams & {
+          projectId: string;
+          traceKey: string;
+          thread: Thread;
+        };
+        response: null;
+      };
+      // Update settings + the "we just updated" signal (pulled once on mount,
+      // race-free vs. the fire-and-forget `updateStatusChanged` message).
+      updateMode: { params: Record<string, never>; response: UpdateMode };
+      setUpdateMode: { params: { mode: UpdateMode }; response: null };
+      pendingInstalledVersion: {
+        params: Record<string, never>;
+        response: string | null;
+      };
+      // Decide (and record) whether to show the GitHub-star reminder on this
+      // app open. Seeding + the 4-day throttle + the nag cap all resolve in the
+      // bun side, so the renderer only has to render when `show` is true.
+      githubStarReminderShouldShow: {
+        params: Record<string, never>;
+        response: { show: boolean };
+      };
+      // Retire the star reminder for good (the user clicked through to GitHub).
+      githubStarReminderDismissForever: {
+        params: Record<string, never>;
+        response: null;
+      };
+      // The next unseen one-time feature reminder (`null` once all are seen).
+      // Pure read — recording is deferred to `featureReminderMarkSeen`, so this
+      // is idempotent and can't burn a reminder that never actually showed.
+      featureReminderNext: {
+        params: Record<string, never>;
+        response: FeatureReminder | null;
+      };
+      // Record a feature reminder as seen (on dismiss / click-through) so it
+      // never appears again.
+      featureReminderMarkSeen: {
+        params: { id: string };
+        response: null;
+      };
+      // The current GitHub sign-in state, pulled once on mount. Later transitions
+      // arrive via the `githubAuthChanged` message. Never carries the token.
+      githubAuthStatus: {
+        params: Record<string, never>;
+        response: GithubAuthState;
+      };
+    };
+    // Messages the webview SENDS and the bun side handles.
+    messages: {
+      sendStreamThreadRequest: StreamThreadRequestPayload;
+      abortStreamThread: AbortStreamThreadPayload;
+      // A unified command dispatched from the webview to run in the bun process
+      // (e.g. window zoom / reload). See `shared/commands.ts`.
+      executeCommand: Command;
+      // Fire-and-forget: a renderer-only, anonymous analytics event. The bun
+      // side is the single network egress for telemetry. See `shared/analytics.ts`.
+      captureAnalyticsEvent: AnalyticsEvent;
+      // Cancel the in-flight deep-link shared-thread import (aborts the read; no
+      // file is written). Sent when the user clicks Cancel on the import modal.
+      cancelSharedImport: Record<string, never>;
+      // Sent only after the renderer has attached its shared-import listener.
+      // Cold-start URLs stay buffered in bun until this handshake completes.
+      deepLinkReady: Record<string, never>;
+    };
+  }>;
+  webview: RPCSchema<{
+    requests: Record<string, never>;
+    // Messages the bun side SENDS and the webview handles.
+    messages: {
+      receiveStreamThreadResponse: StreamThreadResponsePayload;
+      // OS-level fullscreen state changed (entered/exited).
+      fullScreenChanged: { fullScreen: boolean };
+      // App-update flow progress from the bun-side updater service.
+      updateStatusChanged: UpdateStatusChangedPayload;
+      // GitHub sign-in state changed (signed in/out, or a Device Flow started /
+      // failed). Drives the sidebar account widget and the Account settings page.
+      githubAuthChanged: GithubAuthState;
+      // A unified command dispatched from the bun process (native menu / global
+      // shortcuts) to run in the webview. See `shared/commands.ts`.
+      executeCommand: Command;
+      // Deep-link shared-thread import progress: drives the "importing…" modal
+      // and, on success, opens the imported thread. See `bun/deep-link`.
+      sharedImportStatusChanged: SharedImportStatusPayload;
+      // Remote SSH connection progress and status updates from the bun side.
+      remoteServerStatusChanged: RemoteServerStatusChangedPayload;
+      pluginsChanged: Record<string, never>;
+      pluginCommandExecutionChanged: PluginCommandExecutionEvent;
+    };
+  }>;
+}

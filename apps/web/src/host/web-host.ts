@@ -1,0 +1,86 @@
+import type { HostServices, ModelClient } from "@llm-space/ui/host";
+
+/** Unavailable in the display-only viewer — never called while presentational. */
+function unavailable(): never {
+  throw new Error("This action is not available in the shared-thread viewer.");
+}
+
+/**
+ * A display-only {@link HostServices}: `presentational` hides all edit/run
+ * chrome, and every capability is a no-op (or throws if somehow invoked). No
+ * Generation transport / tool execution / model client are unavailable, so
+ * nothing reaches a backend.
+ */
+export const webHost: HostServices = {
+  presentational: true,
+  createTransport: () => null,
+  executeTool: null,
+  skills: {
+    getSettings: () => Promise.resolve({ discoveryPaths: [] }),
+    listAvailable: () => Promise.resolve([]),
+    listSkills: () => Promise.resolve([]),
+  },
+  mcp: {
+    listServers: () => Promise.resolve([]),
+    listTools: () => unavailable(),
+  },
+  builtinTools: {
+    list: () => Promise.resolve([]),
+    fsReveal: () => unavailable(),
+  },
+  pluginTools: {
+    list: () => Promise.resolve([]),
+  },
+  paths: {
+    ensureRootDir: (relativePath) => Promise.resolve(relativePath),
+  },
+  files: {
+    resolvePath: (path) => Promise.resolve(path),
+    // No filesystem in the display-only viewer; `@include` resolves to "".
+    readText: () => Promise.resolve(""),
+    exists: () => Promise.resolve(false),
+    directoryExists: () => Promise.resolve(null),
+    pickFile: () => Promise.resolve(null),
+    pickDirectory: () => Promise.resolve(null),
+  },
+  // No code generation in the display-only viewer.
+  generator: null,
+  actions: {
+    openSettings: () => {
+      /* no settings surface in the viewer */
+    },
+    openLink: (url) => window.open(url, "_blank", "noopener,noreferrer"),
+    shareThread: () => {
+      /* no share surface in the viewer */
+    },
+    openVariables: () => {
+      /* no variables dialog in the viewer */
+    },
+    registerOpenVariables: () => () => {
+      /* nothing to unregister */
+    },
+    registerRunThread: () => () => {
+      /* nothing to unregister */
+    },
+  },
+};
+
+/** An empty {@link ModelClient}: the viewer shows `thread.modelName`, not a list. */
+export const webModelClient: ModelClient = {
+  availableModels: () => Promise.resolve([]),
+  builtinProviders: () => Promise.resolve([]),
+  getDefaultModel: () => Promise.resolve(null),
+  setDefaultModel: () => Promise.resolve(null),
+  removeProvider: () => Promise.resolve([]),
+  addProvider: () => Promise.resolve([]),
+  addCustomProvider: () => Promise.resolve([]),
+  addProviderProfile: () => Promise.resolve([]),
+  updateProviderProfile: () => Promise.resolve([]),
+  removeProviderProfile: () => Promise.resolve([]),
+  updateProvider: () => Promise.resolve([]),
+  setModelEnabled: () => Promise.resolve([]),
+  setAllModelsEnabled: () => Promise.resolve([]),
+  testModelConnection: () => Promise.resolve(),
+  removeCustomModel: () => Promise.resolve([]),
+  upsertCustomModel: () => Promise.resolve([]),
+};

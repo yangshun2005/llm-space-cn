@@ -1,0 +1,711 @@
+"use client";
+
+import type { FileNode, Message, Tool } from "@llm-space/core";
+import { ConfirmDialog } from "@llm-space/ui/components/confirm-dialog";
+import {
+  getPromptExample,
+  resolveSeed,
+} from "@llm-space/ui/components/thread-playground/examples/prompts";
+import { useHostServices } from "@llm-space/ui/host";
+import {
+  basename,
+  parentOf,
+  threadFileNameFromTitle,
+  validateThreadFileStem,
+} from "@llm-space/ui/lib/thread-file";
+import { cn } from "@llm-space/ui/lib/utils";
+import {
+  Empty,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyTitle,
+} from "@llm-space/ui/ui/empty";
+import { Spinner } from "@llm-space/ui/ui/spinner";
+import {
+  FolderBookmarkIcon,
+  FolderInputIcon,
+  MessagesSquare,
+} from "lucide-react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
+
+import { useRegisterCommands } from "@/commands";
+import {
+  TreeView,
+  type TreeDataItem,
+  type TreeRenderItemParams,
+} from "@/components/tree-view";
+import { useI18n } from "@/i18n/i18n-provider";
+import { formatMessage } from "@/i18n/messages";
+import { useFullScreen } from "@/lib/use-full-screen";
+import type { RuntimeId } from "@/shared/runtime";
+
+
+import type { AcquireFileMutation } from "./file-mutation-guard";
+import { NodeActions, RootActions } from "./node-actions";
+import { useFileSystemTree, type MoveConflict } from "./use-file-system-tree";
+
+const _isWindows =
+  typeof navigator !== "undefined" && /Win/i.test(navigator.userAgent);
+
+/** The special workspace folder that deep-link shared-thread imports land in. */
+const SHARED_DIR = "shared";
+/** The special workspace folder that Thread Storage imports land in. */
+const IMPORTED_DIR = "imported";
+/** Shared accent color for system import folders. */
+const IMPORT_DIR_COLOR = "text-sky-400";
+/** System folders pinned before ordinary root entries, in display order. */
+const SPECIAL_ROOT_DIRS = [IMPORTED_DIR, SHARED_DIR] as const;
+
+/** Ancestor directory paths of a workspace file, shallowest-first (`a/b/c.json`
+ * → `["a", "a/b"]`). */
+function _ancestorDirs(filePath: string): string[] {
+  const parts = filePath.split("/");
+  parts.pop(); // drop the filename
+  const dirs: string[] = [];
+  let acc = "";
+  for (const part of parts) {
+    acc = acc ? `${acc}/${part}` : part;
+    dirs.push(acc);
+  }
+  return dirs;
+}
+
+function _FileSystemTreeView({
+  className,
+  headerStart,
+  runtimeId,
+  activeFilePath,
+  onSelectFile,
+  onRemove,
+  onMove,
+  acquireMutation,
+}: {
+  className?: string;
+  runtimeId: RuntimeId;
+  /** Active tab's file in this runtime; synchronization never opens a tab. */
+  activeFilePath?: string | null;
+  headerStart?: ReactNode;
+  /** Fired with a file's path when it is selected (folders aren't selectable). */
+  onSelectFile?: (path: string, runtimeId: RuntimeId) => void;
+  /** Fired with a path after it (file or directory) is successfully deleted. */
+  onRemove?: (path: string, runtimeId: RuntimeId) => void;
+  /** Fired after a path changes via rename or move (`from` → `to`). */
+  onMove?: (from: string, to: string, runtimeId: RuntimeId) => void;
+  acquireMutation?: AcquireFileMutation;
+}) {
+  const fullScreen = useFullScreen();
+  const seedHost = useHostServices();
+  const { t } = useI18n();
+  const trashName = _isWindows ? t.fileTree.recycleBinName : t.fileTree.trashName;
+  const mutationReconciliation = useMemo(
+    () => ({ onMove, onRemove }),
+    [onMove, onRemove]
+  );
+  const {
+    nodesByPath,
+    loadingByPath,
+    isRootLoading,
+    expanded,
+    toggle,
+    expand,
+    refresh,
+    createFolder,
+    createFile,
+    createFileFromPromptExample,
+    remove,
+    duplicate,
+    reveal,
+    move,
+    rename,
+  } = useFileSystemTree(runtimeId, acquireMutation, mutationReconciliation);
+
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
+  // A pending drag-drop name collision awaiting the user's overwrite decision.
+  // `resolve` is the promise gate handed to `move`'s `confirmOverwrite`.
+  const [overwriteConflict, setOverwriteConflict] = useState<
+    (MoveConflict & { resolve: (overwrite: boolean) => void }) | null
+  >(null);
+  // Path of a just-created node we want to expand-to, scroll to, and rename
+  // once its parent's listing has loaded.
+  const [pendingReveal, setPendingReveal] = useState<string | null>(null);
+  // Path of a just-created *file* whose create flow ends with the in-place
+  // rename. Once that rename concludes we open it in a tab (folders excluded).
+  const [pendingOpen, setPendingOpen] = useState<string | null>(null);
+  // Node to select in the tree, driven programmatically (e.g. revealing a
+  // freshly created file once its rename completes).
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Path of a thread created via the "New Thread" menu: revealed (selected +
+  // opened + scrolled to) once its listing loads, but never renamed.
+  const [pendingThread, setPendingThread] = useState<string | null>(null);
+  // Path of a just-duplicated node: selected + scrolled to once its listing
+  // loads (no rename, no tab — works for both files and folders).
+  const [pendingDuplicate, setPendingDuplicate] = useState<string | null>(null);
+  const [openActionsPath, setOpenActionsPath] = useState<string | null>(null);
+  const treeRootRef = useRef<HTMLDivElement>(null);
+  const pendingActiveScroll = useRef<string | null>(null);
+
+  // One-way tab → tree synchronization. Do not reuse pendingThread: that flow
+  // calls onSelectFile and could reactivate a stale tab after an async listing.
+  // Expand only on a tab/runtime change, so manual folder collapse stays put.
+  useEffect(() => {
+    pendingActiveScroll.current = activeFilePath ?? null;
+    setSelectedId(activeFilePath ?? null);
+    if (activeFilePath) {
+      for (const dir of _ancestorDirs(activeFilePath)) expand(dir);
+    }
+  }, [activeFilePath, runtimeId, expand]);
+
+  // Listings arrive independently. Wait until the actual row is mounted, and
+  // cancel obsolete frames on tab changes without moving keyboard focus.
+  useEffect(() => {
+    const path = pendingActiveScroll.current;
+    if (!path) return;
+    const frame = requestAnimationFrame(() => {
+      const row = treeRootRef.current?.querySelector(
+        `[data-tree-id="${CSS.escape(path)}"]`
+      );
+      if (!row) return;
+      row.scrollIntoView({ block: "nearest" });
+      pendingActiveScroll.current = null;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeFilePath, runtimeId, nodesByPath]);
+
+  // Open a freshly created file in a tab and select its node in the tree.
+  function revealCreatedFile(path: string) {
+    setSelectedId(path);
+    onSelectFile?.(path, runtimeId);
+  }
+
+  // Quick thread flow (⌘N/menu/tab-bar/welcome): create an auto-named thread in
+  // `parent` (root by default), no in-place rename, then open it.
+  const createThread = useCallback(
+    async (parent = "") => {
+      const path = await createFile(parent);
+      if (path) setPendingThread(path);
+    },
+    [createFile]
+  );
+
+  const createThreadFromPromptExample = useCallback(
+    async (
+      parent: string,
+      fileStem: string,
+      systemPrompt: string,
+      tools?: Tool[],
+      messages?: Message[],
+      textVariables?: Record<string, string>
+    ) => {
+      const path = await createFileFromPromptExample(parent, {
+        fileStem,
+        systemPrompt,
+        tools,
+        messages,
+        textVariables,
+      });
+      if (path) setPendingThread(path);
+    },
+    [createFileFromPromptExample]
+  );
+
+  const openNodeActionsMenu = useCallback((path: string, event: MouseEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setOpenActionsPath(path);
+  }, []);
+
+  // The file-tree commands, backed by this component's state. The ⌘N menu /
+  // tab "+" / welcome dispatch `newFile` with no `rename`, giving the quick
+  // auto-named flow; the tree/root "New file" icons pass `rename: true` for the
+  // in-place rename flow.
+  useRegisterCommands({
+    newFile: ({ parent = "", rename, runtimeId: commandRuntimeId }) => {
+      if (commandRuntimeId && commandRuntimeId !== runtimeId) return;
+      if (rename) void create(parent, "file");
+      else void createThread(parent);
+    },
+    newFileFromPromptExample: ({
+      parent = "",
+      exampleId,
+      runtimeId: commandRuntimeId,
+    }) => {
+      if (commandRuntimeId && commandRuntimeId !== runtimeId) return;
+      const example = getPromptExample(exampleId);
+      if (!example) return;
+      // Resolve the seed fields (each may be a factory re-read at creation
+      // time — e.g. the General Agent's live skills list) before seeding.
+      void (async () => {
+        const [content, tools, messages, textVariables] = await Promise.all([
+          resolveSeed(example.content, seedHost),
+          resolveSeed(example.tools, seedHost),
+          resolveSeed(example.messages, seedHost),
+          resolveSeed(example.textVariables, seedHost),
+        ]);
+        await createThreadFromPromptExample(
+          parent,
+          example.fileStem,
+          content ?? "",
+          tools,
+          messages,
+          textVariables
+        );
+      })();
+    },
+    newFolder: ({ parent = "", runtimeId: commandRuntimeId }) => {
+      if (commandRuntimeId && commandRuntimeId !== runtimeId) return;
+      void create(parent, "folder");
+    },
+    renameFile: ({ path, runtimeId: commandRuntimeId }) => {
+      if (commandRuntimeId && commandRuntimeId !== runtimeId) return;
+      startRenameByPath(path);
+    },
+    duplicateFile: ({ path, runtimeId: commandRuntimeId }) => {
+      if (commandRuntimeId && commandRuntimeId !== runtimeId) return;
+      void duplicateNode(path);
+    },
+    deleteFile: ({ path, runtimeId: commandRuntimeId }) => {
+      if (commandRuntimeId && commandRuntimeId !== runtimeId) return;
+      setDeleting(path);
+    },
+    revealFile: ({ path, runtimeId: commandRuntimeId }) => {
+      if (commandRuntimeId && commandRuntimeId !== runtimeId) return;
+      void reveal(path);
+    },
+    refreshTree: () => refresh(),
+    revealInTree: ({ path, runtimeId: commandRuntimeId }) => {
+      if (commandRuntimeId && commandRuntimeId !== runtimeId) return;
+      // Expand every ancestor folder so the file's row can render, refresh so a
+      // just-written file appears, then reuse the reveal flow (select + open +
+      // scroll once its parent listing loads).
+      for (const dir of _ancestorDirs(path)) expand(dir);
+      refresh();
+      setPendingThread(path);
+    },
+  });
+
+  // Once the new thread shows up in its parent's listing, reveal it (select +
+  // open + scroll), skipping the rename step the tree's own create flow uses.
+  useEffect(() => {
+    if (!pendingThread) return;
+    const siblings = nodesByPath.get(parentOf(pendingThread));
+    if (!siblings?.some((n) => n.path === pendingThread)) return;
+    const path = pendingThread;
+    setSelectedId(path);
+    onSelectFile?.(path, runtimeId);
+    requestAnimationFrame(() => {
+      document
+        .querySelector(`[data-tree-id="${CSS.escape(path)}"]`)
+        ?.scrollIntoView({ block: "nearest" });
+    });
+    setPendingThread(null);
+  }, [pendingThread, nodesByPath, onSelectFile, runtimeId]);
+
+  async function duplicateNode(path: string) {
+    const dest = await duplicate(path);
+    if (!dest) return;
+    const parent = parentOf(dest);
+    if (parent !== "") expand(parent);
+    setPendingDuplicate(dest);
+  }
+
+  // Once the copy shows up in its parent's listing, select + scroll to it.
+  useEffect(() => {
+    if (!pendingDuplicate) return;
+    const siblings = nodesByPath.get(parentOf(pendingDuplicate));
+    if (!siblings?.some((n) => n.path === pendingDuplicate)) return;
+    const path = pendingDuplicate;
+    setSelectedId(path);
+    requestAnimationFrame(() => {
+      document
+        .querySelector(`[data-tree-id="${CSS.escape(path)}"]`)
+        ?.scrollIntoView({ block: "nearest" });
+    });
+    setPendingDuplicate(null);
+  }, [pendingDuplicate, nodesByPath]);
+
+  async function create(parent: string, kind: "file" | "folder") {
+    const path =
+      kind === "file" ? await createFile(parent) : await createFolder(parent);
+    if (!path) return;
+    if (parent !== "") expand(parent);
+    setPendingReveal(path);
+    if (kind === "file") setPendingOpen(path);
+  }
+
+  // When the new node's parent listing contains it, reveal + rename it.
+  useEffect(() => {
+    if (!pendingReveal) return;
+    const siblings = nodesByPath.get(parentOf(pendingReveal));
+    if (!siblings?.some((n) => n.path === pendingReveal)) return;
+    setRenaming(pendingReveal);
+    requestAnimationFrame(() => {
+      document
+        .querySelector(`[data-tree-id="${CSS.escape(pendingReveal)}"]`)
+        ?.scrollIntoView({ block: "nearest" });
+    });
+    setPendingReveal(null);
+  }, [pendingReveal, nodesByPath]);
+
+  const data = useMemo<TreeDataItem[]>(() => {
+    const toItem = (node: FileNode): TreeDataItem => {
+      const actions = (
+        <NodeActions
+          node={node}
+          runtimeId={runtimeId}
+          menuOpen={openActionsPath === node.path}
+          onMenuOpenChange={(open) => {
+            setOpenActionsPath(open ? node.path : null);
+          }}
+        />
+      );
+      if (node.type === "directory") {
+        const open = expanded.has(node.path);
+        // Empty array stays truthy so the directory still renders an expand
+        // chevron while its listing loads.
+        const children =
+          open && nodesByPath.has(node.path) ? build(node.path) : [];
+        return {
+          id: node.path,
+          name: node.name,
+          draggable: true,
+          droppable: true,
+          onClick: () => toggle(node.path),
+          onContextMenu: (event) => openNodeActionsMenu(node.path, event),
+          // While renaming, render as a leaf (a div) instead of an accordion
+          // trigger (a button) so the input's keys (Space/Enter) don't toggle
+          // the node. A renamed folder is always collapsed first (see
+          // startRename), so there is nothing hidden by dropping its children.
+          children: renaming === node.path ? undefined : children,
+          actions,
+          loading: open && loadingByPath.has(node.path),
+        };
+      }
+      return {
+        id: node.path,
+        name: node.name.replace(/\.json$/, ""),
+        icon: MessagesSquare,
+        draggable: true,
+        droppable: false,
+        onContextMenu: (event) => openNodeActionsMenu(node.path, event),
+        actions,
+      };
+    };
+
+    // Only directories and *.json files are shown in the tree.
+    const build = (dirPath: string): TreeDataItem[] => {
+      const items = (nodesByPath.get(dirPath) ?? [])
+        .filter(
+          (node) => node.type === "directory" || node.name.endsWith(".json")
+        )
+        .map(toItem);
+      // Pin system import folders to the top of the root. Array.sort is stable,
+      // so everything else keeps its existing order.
+      if (dirPath === "") {
+        items.sort((a, b) => {
+          const aRank = SPECIAL_ROOT_DIRS.findIndex((dir) => dir === a.id);
+          const bRank = SPECIAL_ROOT_DIRS.findIndex((dir) => dir === b.id);
+          return (
+            (aRank === -1 ? SPECIAL_ROOT_DIRS.length : aRank) -
+            (bRank === -1 ? SPECIAL_ROOT_DIRS.length : bRank)
+          );
+        });
+      }
+      return items;
+    };
+
+    return build("");
+  }, [
+    nodesByPath,
+    loadingByPath,
+    expanded,
+    toggle,
+    renaming,
+    openActionsPath,
+    openNodeActionsMenu,
+    runtimeId,
+  ]);
+
+  // Start an in-place rename of the node at `path`. Only directories can be
+  // expanded, so collapse first (the row renders as a leaf while editing) to
+  // remount it consistently afterwards.
+  function startRenameByPath(path: string) {
+    if (expanded.has(path)) toggle(path);
+    setRenaming(path);
+  }
+
+  function onDocumentDrag(source: TreeDataItem, target: TreeDataItem) {
+    // Only directories and the root drop-zone are droppable, so the target is
+    // always a directory ("" = root). On a name collision, `move` pauses on
+    // `confirmOverwrite` while we surface the overwrite dialog.
+    void move(source.id, target.id, {
+      confirmOverwrite: (info) =>
+        new Promise<boolean>((resolve) => {
+          setOverwriteConflict({ ...info, resolve });
+        }),
+    });
+  }
+
+  function renderItem(p: TreeRenderItemParams) {
+    const isRenaming = renaming === p.item.id;
+    // Files carry an icon; folders don't (chevron only). Keyed off the item, not
+    // `isLeaf`, since a folder is rendered as a leaf while being renamed.
+    const Icon = p.item.icon;
+    // System import folders get dedicated icons and accent colors so they stand
+    // out from user folders.
+    const isSharedFolder = p.item.id === SHARED_DIR;
+    const isImportedFolder = p.item.id === IMPORTED_DIR;
+    return (
+      <>
+        {isImportedFolder && (
+          <FolderInputIcon
+            className={cn("mr-2 h-4 w-4 shrink-0", IMPORT_DIR_COLOR)}
+          />
+        )}
+        {isSharedFolder && (
+          <FolderBookmarkIcon
+            className={cn("mr-2 h-4 w-4 shrink-0", IMPORT_DIR_COLOR)}
+          />
+        )}
+        {Icon && <Icon className="text-primary mr-2 h-4 w-4 shrink-0" />}
+        {isRenaming ? (
+          <RenameInput
+            initial={p.item.name}
+            onCancel={() => {
+              setRenaming(null);
+              // Create flow cancelled: the file already exists at its untitled
+              // path, so reveal it as-is.
+              if (pendingOpen === p.item.id) {
+                setPendingOpen(null);
+                revealCreatedFile(p.item.id);
+              }
+            }}
+            onConfirm={(value) => {
+              const base = value.trim();
+              setRenaming(null);
+              const from = p.item.id;
+              const openAfter = pendingOpen === from;
+              if (openAfter) setPendingOpen(null);
+              if (base && base !== p.item.name) {
+                // `Icon` is only set on files, so it distinguishes file vs
+                // folder even while the row is rendered as a leaf for renaming.
+                void rename(
+                  from,
+                  Icon ? threadFileNameFromTitle(base) : base
+                ).then((to) => {
+                  if (to) {
+                    if (openAfter) revealCreatedFile(to);
+                  } else if (openAfter) {
+                    // Rename was a no-op/failed; the file still lives at `from`.
+                    revealCreatedFile(from);
+                  }
+                });
+              } else if (openAfter) {
+                // Name left unchanged: reveal the created file at its path.
+                revealCreatedFile(from);
+              }
+            }}
+          />
+        ) : (
+          <span
+            className={cn(
+              "min-w-0 grow truncate text-left text-sm",
+              (isSharedFolder || isImportedFolder) &&
+                cn("font-medium", IMPORT_DIR_COLOR)
+            )}
+          >
+            {p.item.name}
+          </span>
+        )}
+        {!isRenaming && (
+          <div className="ml-1 hidden shrink-0 group-hover:flex has-data-[state=open]:flex">
+            {p.item.actions}
+          </div>
+        )}
+      </>
+    );
+  }
+
+  return (
+    <div ref={treeRootRef} className={cn("flex h-full flex-col", className)}>
+      <header className="text-muted-foreground electrobun-webkit-app-region-drag flex h-11.5 items-center justify-between px-3 text-xs font-medium">
+        {headerStart ?? (
+          <span className={cn(fullScreen ? "opacity-100" : "opacity-0")}>
+            LLM Space 4
+          </span>
+        )}
+        <span>
+          <RootActions runtimeId={runtimeId} />
+        </span>
+      </header>
+
+      <div className="min-h-0 flex-1 overflow-auto">
+        {isRootLoading ? (
+          <div className="flex items-center justify-center p-4">
+            <Spinner />
+          </div>
+        ) : data.length === 0 ? (
+          <Empty className="h-full">
+            <EmptyHeader>
+              <EmptyTitle>{t.fileTree.emptyTitle}</EmptyTitle>
+              <EmptyDescription>
+                {t.fileTree.emptyDescription}
+              </EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        ) : (
+          <TreeView
+            data={data}
+            expandedIds={[...expanded]}
+            selectedId={selectedId}
+            renderItem={renderItem}
+            onDocumentDrag={onDocumentDrag}
+            onSelectChange={(item) => {
+              pendingActiveScroll.current = null;
+              setSelectedId(item?.id ?? null);
+              if (item) onSelectFile?.(item.id, runtimeId);
+            }}
+          />
+        )}
+      </div>
+
+      <ConfirmDialog
+        open={!!deleting}
+        onOpenChange={(open) => {
+          if (!open) setDeleting(null);
+        }}
+        title={
+          <>
+            {t.fileTree.moveTitlePrefix}
+            {deleting ? basename(deleting).replace(/\.json$/, "") : ""}
+            {t.fileTree.moveTitleMiddle}
+            {trashName}
+            {t.fileTree.moveTitleSuffix}
+          </>
+        }
+        description={`${t.fileTree.moveDescriptionPrefix}${trashName}${t.fileTree.moveDescriptionSuffix}`}
+        confirmLabel={`${t.fileTree.moveConfirmPrefix}${trashName}`}
+        onConfirm={() => {
+          const path = deleting;
+          setDeleting(null);
+          if (path) {
+            void remove(path);
+          }
+        }}
+      />
+
+      <ConfirmDialog
+        open={!!overwriteConflict}
+        onOpenChange={(open) => {
+          // Any dismissal (cancel, Esc, outside click) declines the overwrite.
+          if (!open && overwriteConflict) {
+            overwriteConflict.resolve(false);
+            setOverwriteConflict(null);
+          }
+        }}
+        title={
+          <>
+            {t.fileTree.replaceTitlePrefix}
+            {overwriteConflict
+              ? overwriteConflict.isDir
+                ? overwriteConflict.name
+                : overwriteConflict.name.replace(/\.json$/, "")
+              : ""}
+            {t.fileTree.replaceTitleSuffix}
+          </>
+        }
+        description={
+          overwriteConflict
+            ? formatMessage(
+                overwriteConflict.isDir
+                  ? t.fileTree.replaceDescriptionFolder
+                  : t.fileTree.replaceDescriptionThread,
+                { trash: trashName }
+              )
+            : undefined
+        }
+        confirmLabel={t.fileTree.replace}
+        onConfirm={() => {
+          overwriteConflict?.resolve(true);
+          setOverwriteConflict(null);
+        }}
+      />
+    </div>
+  );
+}
+
+// Memoized so opening/closing a thread tab (which re-renders the page shell it
+// sits in) doesn't redraw the whole tree — its props (the tab callbacks and the
+// mode-derived className) are stable across tab changes.
+export const FileSystemTreeView = memo(_FileSystemTreeView);
+
+/** In-place rename input: Enter / blur confirms, Esc cancels. */
+function RenameInput({
+  initial,
+  onConfirm,
+  onCancel,
+}: {
+  initial: string;
+  onConfirm: (value: string) => void;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState(initial);
+  const validation = validateThreadFileStem(value);
+  return (
+    <span className="relative min-w-0 grow">
+      <input
+        autoFocus
+        autoCapitalize="off"
+        autoComplete="off"
+        autoCorrect="off"
+        value={value}
+        aria-invalid={!validation.valid}
+        aria-describedby="tree-rename-error"
+        className="ring-border bg-background text-foreground focus-visible:ring-ring/50 aria-invalid:ring-destructive/40 aria-invalid:focus-visible:ring-destructive/50 box-border h-5 w-full min-w-0 grow rounded px-1 text-sm leading-none ring-1 outline-none ring-inset focus-visible:ring-2"
+        onChange={(e) => setValue(e.target.value)}
+        onClick={(e) => e.stopPropagation()}
+        onPointerDown={(e) => e.stopPropagation()}
+        onFocus={(e) => e.currentTarget.select()}
+        onBlur={() => {
+          if (validation.valid) {
+            onConfirm(validation.value);
+          } else {
+            onCancel();
+          }
+        }}
+        onKeyDown={(e) => {
+          // Stop the accordion trigger (this input lives inside its button) from
+          // reacting to keys like Space/Enter that would toggle the node.
+          e.stopPropagation();
+          e.nativeEvent.stopImmediatePropagation();
+          if (e.key === "Enter") {
+            e.preventDefault();
+            if (validation.valid) {
+              onConfirm(validation.value);
+            }
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            onCancel();
+          }
+        }}
+      />
+      {!validation.valid && (
+        <span
+          id="tree-rename-error"
+          className="text-destructive bg-background absolute top-full left-1 z-10 mt-1 text-xs whitespace-nowrap"
+        >
+          {validation.error}
+        </span>
+      )}
+    </span>
+  );
+}

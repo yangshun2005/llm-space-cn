@@ -1,0 +1,189 @@
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
+
+import {
+  atomicWriteJsonFile,
+  getSettingsDir,
+  readJsonFile,
+} from "@llm-space/core/server";
+import { z } from "zod";
+
+import type { FeatureReminder } from "../../shared/feature-reminders";
+import { FEATURE_REMINDERS } from "../../shared/feature-reminders";
+
+/**
+ * Persisted reminder state (`settings/reminders.json`). Today it backs the
+ * GitHub-star nudge; the file is namespaced per reminder so future pushes
+ * (changelog, etc.) can slot in beside `githubStar` without reshaping it.
+ */
+interface GithubStarReminder {
+  // How many times the app has been opened (bumped once per launch). The very
+  // first appearance is gated on this reaching 2 — i.e. the second open.
+  openCount?: number;
+  // When we last decided to show the reminder (ms epoch); anchors the 2-day
+  // throttle for every appearance after the first.
+  lastShownDate?: number;
+  // How many times the reminder has been shown; capped at MAX_SHOWN_COUNT.
+  shownCount?: number;
+  // Id and decision for the latest real app launch. Renderer effects may ask
+  // more than once (for example under React Strict Mode); repeated requests
+  // for the same launch must return the same answer without bumping counters.
+  lastResolvedLaunchId?: string;
+  lastResolvedShow?: boolean;
+  // Retired for good — set when the user clicks through to GitHub, or once the
+  // nag cap is reached. Never shown again after this.
+  dismissedForever?: boolean;
+}
+
+interface RemindersState {
+  githubStar?: GithubStarReminder;
+  // Ids of one-time feature reminders the user has already been shown. Each
+  // reminder pops at most once ever; see `resolveNextFeatureReminder`.
+  featureRemindersSeen?: string[];
+}
+
+const RemindersStateSchema: z.ZodType<RemindersState> = z.object({
+  githubStar: z
+    .object({
+      openCount: z.number().optional(),
+      lastShownDate: z.number().optional(),
+      shownCount: z.number().optional(),
+      lastResolvedLaunchId: z.string().optional(),
+      lastResolvedShow: z.boolean().optional(),
+      dismissedForever: z.boolean().optional(),
+    })
+    .optional(),
+  featureRemindersSeen: z.array(z.string()).optional(),
+});
+let stateQueue: Promise<unknown> = Promise.resolve();
+
+/** Show the star nudge at most once every 2 days. */
+const REMINDER_INTERVAL_MS = 2 * 24 * 60 * 60 * 1000;
+/** Give up (retire the reminder) after this many shows, click or no click. */
+const MAX_SHOWN_COUNT = 3;
+/** Stable for this Bun process; a real app restart receives a new id. */
+const REMINDER_LAUNCH_ID = randomUUID();
+
+async function _load(): Promise<RemindersState> {
+  return (
+    await readJsonFile(join(getSettingsDir(), "reminders.json"), {
+      schema: RemindersStateSchema,
+      recovery: "best-effort",
+      fallback: () => ({}),
+      seedMissing: false,
+    })
+  ).value;
+}
+
+function _update<T>(
+  mutate: (state: RemindersState) => { state: RemindersState; result: T }
+): Promise<T> {
+  const operation = stateQueue
+    .catch(() => undefined)
+    .then(async () => {
+      const update = mutate(await _load());
+      await atomicWriteJsonFile(
+        join(getSettingsDir(), "reminders.json"),
+        update.state
+      );
+      return update.result;
+    });
+  stateQueue = operation;
+  return operation;
+}
+
+async function _saveGithubStar(patch: GithubStarReminder): Promise<void> {
+  await _update((state) => ({
+    state: { ...state, githubStar: { ...state.githubStar, ...patch } },
+    result: undefined,
+  }));
+}
+
+/** Whether the reminder should appear on this open (pure; no side effects). */
+function _shouldShow(
+  star: GithubStarReminder,
+  openCount: number,
+  now: number
+): boolean {
+  if (star.dismissedForever) return false;
+  // First appearance is gated on the *second* open of the whole lifetime, not
+  // on elapsed time — the first launch just counts and stays silent.
+  if (star.lastShownDate == null) return openCount >= 2;
+  // Every appearance after the first is throttled to once every 2 days.
+  return now - star.lastShownDate >= REMINDER_INTERVAL_MS;
+}
+
+/**
+ * Decide whether to show the GitHub-star reminder on this app open, and record
+ * the decision atomically so the caller only has to render.
+ *
+ * Rules (checked once per launch):
+ * - Every launch bumps `openCount`; the first launch stays silent.
+ * - The reminder first appears on the second open, regardless of elapsed time.
+ * - Later appearances are throttled to once every 2 days since the last show.
+ * - Retire permanently once the user clicks through, or after 3 shows.
+ */
+export async function resolveGithubStarReminder(
+  launchId: string = REMINDER_LAUNCH_ID
+): Promise<{ show: boolean }> {
+  return _update((state) => {
+    const star = state.githubStar ?? {};
+    if (star.lastResolvedLaunchId === launchId) {
+      return {
+        state,
+        result: { show: star.lastResolvedShow ?? false },
+      };
+    }
+
+    const now = Date.now();
+    const openCount = (star.openCount ?? 0) + 1;
+    const show = _shouldShow(star, openCount, now);
+    const patch = show
+      ? {
+          openCount,
+          lastShownDate: now,
+          shownCount: (star.shownCount ?? 0) + 1,
+          lastResolvedLaunchId: launchId,
+          lastResolvedShow: show,
+          dismissedForever: (star.shownCount ?? 0) + 1 >= MAX_SHOWN_COUNT,
+        }
+      : {
+          openCount,
+          lastResolvedLaunchId: launchId,
+          lastResolvedShow: show,
+        };
+    return {
+      state: { ...state, githubStar: { ...star, ...patch } },
+      result: { show },
+    };
+  });
+}
+
+/** Retire the star reminder for good (the user clicked through to GitHub). */
+export async function dismissGithubStarReminder(): Promise<void> {
+  await _saveGithubStar({ dismissedForever: true });
+}
+
+/**
+ * The next unseen feature reminder for this launch (in `FEATURE_REMINDERS`
+ * order), or `null` once all are seen. Pure read — recording is deferred to
+ * `markFeatureReminderSeen` so this stays idempotent (safe to call repeatedly,
+ * e.g. under a StrictMode double-invoke) and can't burn a reminder that never
+ * actually got shown.
+ */
+export async function getNextFeatureReminder(): Promise<FeatureReminder | null> {
+  const seen = new Set((await _load()).featureRemindersSeen ?? []);
+  return FEATURE_REMINDERS.find((reminder) => !seen.has(reminder.id)) ?? null;
+}
+
+/** Record a feature reminder as seen so it never appears again. */
+export async function markFeatureReminderSeen(id: string): Promise<void> {
+  await _update((state) => {
+    const seen = new Set(state.featureRemindersSeen ?? []);
+    seen.add(id);
+    return {
+      state: { ...state, featureRemindersSeen: [...seen] },
+      result: undefined,
+    };
+  });
+}

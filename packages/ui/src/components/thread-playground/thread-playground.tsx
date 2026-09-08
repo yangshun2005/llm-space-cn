@@ -1,0 +1,641 @@
+"use client";
+
+import type {
+  AgentTransport,
+  Thread,
+  ThreadRunReference,
+  ThreadRunSnapshot,
+  ThreadSnapshot,
+} from "@llm-space/core";
+import { isMetaUserMessage } from "@llm-space/core/generator";
+import { planCompaction } from "@llm-space/core/thread";
+import {
+  ChevronDownIcon,
+  EllipsisIcon,
+  FileArchiveIcon,
+  HistoryIcon,
+  PlayIcon,
+  Redo2Icon,
+  Share2Icon,
+  SparklesIcon,
+  Undo2Icon,
+} from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { usePanelRef } from "react-resizable-panels";
+
+import {
+  resolveModelConfig,
+  useDefaultModel,
+  useFirstAvailableModel,
+  useModels,
+} from "@llm-space/ui/components/model-provider";
+import { Tooltip } from "@llm-space/ui/components/tooltip";
+import { createShareThreadAction, useHostServices } from "@llm-space/ui/host";
+import { threadTitleFromPath } from "@llm-space/ui/lib/thread-file";
+import { cn } from "@llm-space/ui/lib/utils";
+import { Button } from "@llm-space/ui/ui/button";
+import { ButtonGroup } from "@llm-space/ui/ui/button-group";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@llm-space/ui/ui/dropdown-menu";
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from "@llm-space/ui/ui/resizable";
+import { Spinner } from "@llm-space/ui/ui/spinner";
+import { Switch } from "@llm-space/ui/ui/switch";
+
+import { GenerateProjectButton } from "./codegen/generate-project-button";
+import { MessageListView } from "./message/message-list-view";
+import { SubagentParentPathContext } from "./message/spawn-agent-card";
+import { ThreadPlaygroundSkeleton } from "./misc/skeleton";
+import { TitleEditor, type TitleValidator } from "./misc/title-editor";
+import { ModelConfigEditor } from "./model/model-config-editor";
+import {
+  ProviderProfileSelectionProvider,
+  useGetProviderProfileId,
+  useProviderProfileSelections,
+} from "./model/provider-profile-selection-provider";
+import { usePlaygroundLabels } from "./playground-labels";
+import { SystemPromptEditor } from "./prompt/system-prompt-editor";
+import { RunHistoryListView } from "./run-history-list-view";
+import { createRuntimePromptFiles } from "./runtime-prompt-files";
+import {
+  canRedo,
+  canUndo,
+  createThreadStore,
+  getAutoRunTools,
+  getReactLoop,
+  ThreadStoreContext,
+  useRunMode,
+  useThreadStore,
+  useThreadStoreActions,
+} from "./stores";
+import { ThreadCompactionDialog } from "./thread-compaction-dialog";
+import { ToolListView } from "./tool/tool-list-view";
+import { useToolExecutor } from "./tool/use-tool-executor";
+import { useShortcuts } from "./use-shortcuts";
+import { useThreadPlaygroundEvents } from "./use-thread-playground-events";
+import { listEnabledPromptVariableSkills } from "./variable/prompt-variable-skills";
+import { PromptVariablesListView } from "./variable/prompt-variables-list-view";
+
+export interface ThreadPlaygroundProps {
+  className?: string;
+  path: string;
+  /** Present only for a saved workspace thread that can create child files. */
+  subagentParentPath?: string;
+  title?: string;
+  headerDetails?: ReactNode;
+  /** Extra actions rendered at the right edge of the header (always visible). */
+  headerActions?: ReactNode;
+  initialValue: Thread;
+  readonly?: boolean;
+  /**
+   * Render image attachments as compact `[Image #N]` placeholders instead of
+   * inline thumbnails. Decided once by the caller (e.g. embedded viewer or a
+   * narrow viewport); not reactive to later resizes.
+   */
+  compactImages?: boolean;
+  /**
+   * Whether this playground belongs to the active tab. Only the active one
+   * registers the `runThread` command handler (the command registry keeps a
+   * single handler per type), so a global run always targets the active tab.
+   */
+  active?: boolean;
+  /** Mount the visual workbench while keeping its owner and store alive. */
+  viewMounted?: boolean;
+  /** The streaming transport used by runs (e.g. HTTP or Electrobun RPC). */
+  transport?: AgentTransport;
+  /** Runtime that owns this playground. Used to route tool calls. */
+  runtimeId?: string;
+  /** Recreate only the thread store while preserving per-tab UI selections. */
+  storeKey?: string | number;
+
+  onChange?: (thread: Thread) => void;
+  /** Persist and open a compacted clone instead of replacing this thread. */
+  onApplyCompaction?: (thread: Thread) => Promise<void>;
+  onRenameTitle?: (title: string) => Promise<boolean>;
+  validateTitle?: TitleValidator;
+  onStreamingStart?: (runId: string) => boolean | void;
+  onStreamingEnd?: (runId: string) => void;
+  archiveRunSnapshot?: (
+    run: ThreadRunSnapshot & { id: string }
+  ) => Promise<ThreadRunReference>;
+  readRunSnapshot?: (snapshotRef: string) => Promise<ThreadSnapshot>;
+}
+
+export function ThreadPlayground({
+  loading,
+  initialValue,
+  className,
+  viewMounted = true,
+  ...props
+}: Omit<ThreadPlaygroundProps, "initialValue"> & {
+  loading?: boolean;
+  initialValue?: Thread | null;
+}) {
+  if (!viewMounted && (loading || !initialValue)) {
+    return null;
+  }
+  if (loading) {
+    return <ThreadPlaygroundSkeleton className={className} />;
+  }
+  if (!initialValue) {
+    throw new Error("initialValue is required when not loading");
+  }
+  return (
+    <_ThreadPlayground
+      className={className}
+      initialValue={initialValue}
+      viewMounted={viewMounted}
+      {...props}
+    />
+  );
+}
+
+function _ThreadPlayground({ storeKey, ...props }: ThreadPlaygroundProps) {
+  const providers = useModels();
+  const profileSelections = useProviderProfileSelections(providers);
+  return (
+    <ProviderProfileSelectionProvider value={profileSelections}>
+      <_ThreadPlaygroundStore key={storeKey} {...props} />
+    </ProviderProfileSelectionProvider>
+  );
+}
+
+function _ThreadPlaygroundStore({
+  initialValue,
+  transport,
+  runtimeId,
+  onApplyCompaction,
+  viewMounted = true,
+  onChange,
+  onStreamingStart,
+  onStreamingEnd,
+  archiveRunSnapshot,
+  readRunSnapshot,
+  ...props
+}: ThreadPlaygroundProps) {
+  const [ownerRuntimeId] = useState(() => runtimeId ?? "local");
+  // Keep live refs to the provider list and default model so the store can
+  // resolve a thread's model (its own, else the default/first available) at
+  // run/edit time without being recreated.
+  const providers = useModels();
+  const providersRef = useRef(providers);
+  providersRef.current = providers;
+  const defaultModel = useDefaultModel();
+  const defaultModelRef = useRef(defaultModel);
+  defaultModelRef.current = defaultModel;
+  const getProfileId = useGetProviderProfileId();
+  const { skills, files } = useHostServices();
+  const toolExecutor = useToolExecutor(ownerRuntimeId);
+  const [store] = useState(() => {
+    const promptFiles = createRuntimePromptFiles(files, ownerRuntimeId);
+    return createThreadStore(initialValue, {
+      transport,
+      resolveModel: (saved) =>
+        resolveModelConfig(
+          providersRef.current,
+          saved,
+          defaultModelRef.current
+        ),
+      getAutoRunTools,
+      getReactLoop,
+      getProfileId,
+      runtimeId: ownerRuntimeId,
+      executeTool: toolExecutor ?? undefined,
+      loadSkills: () =>
+        listEnabledPromptVariableSkills(skills, {
+          runtimeId: ownerRuntimeId,
+        }),
+      loadFile: promptFiles.loadFile,
+      fileExists: promptFiles.fileExists,
+      resolvePath: (path) => files.resolvePath(path),
+      archiveRunSnapshot,
+      readRunSnapshot,
+    });
+  });
+  useThreadPlaygroundEvents(store, {
+    onChange,
+    onStreamingStart,
+    onStreamingEnd,
+  });
+  return (
+    <ThreadStoreContext.Provider value={store}>
+      <SubagentParentPathContext.Provider value={props.subagentParentPath}>
+        {viewMounted ? (
+          <ThreadPlaygroundContent
+            runtimeId={ownerRuntimeId}
+            onApplyCompaction={onApplyCompaction}
+            {...props}
+          />
+        ) : null}
+      </SubagentParentPathContext.Provider>
+    </ThreadStoreContext.Provider>
+  );
+}
+
+/** Size the Run history panel expands to when toggled open. */
+const RUN_HISTORY_PANEL_SIZE = "16rem";
+
+function ThreadPlaygroundContent({
+  className,
+  path,
+  title: titleFromProps,
+  headerDetails,
+  headerActions,
+  runtimeId,
+  onApplyCompaction,
+  onRenameTitle,
+  validateTitle,
+  readonly: readonlyFromProps = false,
+  active = false,
+  compactImages = false,
+}: Omit<
+  ThreadPlaygroundProps,
+  "initialValue" | "onChange" | "onStreamingStart" | "onStreamingEnd"
+>) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const status = useThreadStore((s) => s.status);
+  const savedModel = useThreadStore((s) => s.thread.model);
+  const fallbackModel = useFirstAvailableModel();
+  // A thread can run once a model resolves (its own, or the first available).
+  const hasModel = Boolean(savedModel ?? fallbackModel);
+  const undoable = useThreadStore((s) => canUndo(s.changeHistory));
+  const redoable = useThreadStore((s) => canRedo(s.changeHistory));
+  const messages = useThreadStore((s) => s.thread.context?.messages ?? []);
+  const hasMetaUserPrompt = useThreadStore((s) =>
+    isMetaUserMessage(s.thread.context)
+  );
+  const canCompact = useMemo(
+    () => planCompaction(messages, 0, { hasMetaUserPrompt }).turnCount >= 2,
+    [hasMetaUserPrompt, messages]
+  );
+  const { effectiveAutoRunTools, reactLoop, setAutoRunTools, setReactLoop } =
+    useRunMode();
+  const { run, abort, undo, redo, syncTitle } = useThreadStoreActions();
+  const [systemPromptStreaming, setSystemPromptStreaming] = useState(false);
+  const title = useMemo(
+    () => titleFromProps ?? threadTitleFromPath(path),
+    [path, titleFromProps]
+  );
+  useEffect(() => {
+    syncTitle(title);
+  }, [syncTitle, title]);
+  const { presentational, generator } = useHostServices();
+  const readonly = useMemo(() => {
+    return readonlyFromProps || presentational || status !== "idle";
+  }, [readonlyFromProps, presentational, status]);
+  const handleRun = useCallback(async () => {
+    await run();
+  }, [run]);
+  const { actions } = useHostServices();
+  // Expose run as a host action, but only from the active tab so a global
+  // `runThread` targets it (and no-ops when no tab is active). Skip while
+  // already running to avoid run()'s "already running" throw.
+  useEffect(() => {
+    if (!active) return;
+    return actions.registerRunThread(() => {
+      if (status === "idle") void run();
+    });
+  }, [actions, active, run, status]);
+  const handleStop = useCallback(() => {
+    try {
+      abort();
+    } catch {
+      // Ignored
+    }
+  }, [abort]);
+  const runHistoryPanelRef = usePanelRef();
+  const labels = usePlaygroundLabels();
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [compactDialogOpen, setCompactDialogOpen] = useState(false);
+  const [generateProjectOpen, setGenerateProjectOpen] = useState(false);
+  const toggleHistory = useCallback(() => {
+    const panel = runHistoryPanelRef.current;
+    if (!panel) {
+      return;
+    }
+    if (panel.isCollapsed()) {
+      panel.resize(RUN_HISTORY_PANEL_SIZE);
+    } else {
+      panel.collapse();
+    }
+  }, [runHistoryPanelRef]);
+  const closeHistory = useCallback(() => {
+    runHistoryPanelRef.current?.collapse();
+  }, [runHistoryPanelRef]);
+  const handleShortcuts = useShortcuts({ readonly: readonlyFromProps });
+  return (
+    <div
+      ref={containerRef}
+      className={cn("flex flex-col overflow-hidden", className)}
+      tabIndex={0}
+      onKeyDownCapture={handleShortcuts}
+    >
+      <ResizablePanelGroup>
+        <ResizablePanel className="flex min-h-0 flex-col overflow-hidden">
+          <header
+            className={cn(
+              "flex w-full shrink-0 items-center border-b",
+              headerDetails ? "min-h-14 py-1.5" : "h-12"
+            )}
+          >
+            <div className="min-w-0 grow px-3">
+              <TitleEditor
+                className="w-96 max-w-full"
+                title={title}
+                readonly={readonly || !onRenameTitle}
+                onRename={onRenameTitle}
+                validateTitle={validateTitle}
+              />
+              {headerDetails ? (
+                <div className="mt-0.5 flex min-w-0 items-center">
+                  {headerDetails}
+                </div>
+              ) : null}
+            </div>
+            <div
+              className={cn(
+                "flex items-center gap-0.5 px-1",
+                readonlyFromProps && "hidden"
+              )}
+            >
+              <Tooltip content={labels.undoLastEdit}>
+                <Button
+                  variant="ghost"
+                  size="icon-lg"
+                  aria-label={labels.undoLastEdit}
+                  disabled={readonly || !undoable}
+                  onClick={undo}
+                >
+                  <Undo2Icon className="size-4" />
+                </Button>
+              </Tooltip>
+              <Tooltip content={labels.redoLastEdit}>
+                <Button
+                  variant="ghost"
+                  size="icon-lg"
+                  aria-label={labels.redoLastEdit}
+                  disabled={readonly || !redoable}
+                  onClick={redo}
+                >
+                  <Redo2Icon className="size-4" />
+                </Button>
+              </Tooltip>
+              <DropdownMenu>
+                <Tooltip content={labels.moreActions}>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon-lg"
+                      aria-label={labels.moreActions}
+                    >
+                      <EllipsisIcon className="size-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                </Tooltip>
+                <DropdownMenuContent align="end" className="min-w-52">
+                  <DropdownMenuItem
+                    disabled={status !== "idle"}
+                    onSelect={toggleHistory}
+                  >
+                    <HistoryIcon />
+                    {historyOpen
+                      ? labels.hideRunHistory
+                      : labels.viewRunHistory}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={status !== "idle" || !canCompact}
+                    onSelect={() => setCompactDialogOpen(true)}
+                  >
+                    <FileArchiveIcon />
+                    {labels.compactConversation}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    disabled={status !== "idle" || !hasModel || !generator}
+                    onSelect={() => setGenerateProjectOpen(true)}
+                  >
+                    <SparklesIcon />
+                    <span className="flex-1">{labels.generateProject}</span>
+                    <span className="bg-primary/15 text-primary rounded px-1.5 py-0.5 text-[0.625rem] font-semibold tracking-wide uppercase">
+                      {labels.betaBadge}
+                    </span>
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem
+                    disabled={status !== "idle"}
+                    onSelect={() =>
+                      actions.shareThread(
+                        createShareThreadAction(path, runtimeId)
+                      )
+                    }
+                  >
+                    <Share2Icon />
+                    {labels.shareThread}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+              <GenerateProjectButton
+                disabled={status !== "idle"}
+                open={generateProjectOpen}
+                onOpenChange={setGenerateProjectOpen}
+                showTrigger={false}
+              />
+              <ThreadCompactionDialog
+                disabled={status !== "idle"}
+                open={compactDialogOpen}
+                onOpenChange={setCompactDialogOpen}
+                onApplyCompaction={onApplyCompaction}
+                showTrigger={false}
+              />
+            </div>
+            <div className="flex items-center gap-1 px-3">
+              <ButtonGroup
+                className={cn(
+                  "transition-transform active:translate-y-px",
+                  readonlyFromProps && "hidden"
+                )}
+              >
+                <Tooltip
+                  content={
+                    <div>
+                      {status === "running"
+                        ? labels.stopRunningTooltip
+                        : status === "preparing"
+                          ? labels.preparingThreadTooltip
+                          : labels.runThreadTooltip}
+                    </div>
+                  }
+                >
+                  <Button
+                    className="border-r-primary border-none pr-1 pl-4 active:translate-y-0!"
+                    aria-label={
+                      status === "running"
+                        ? labels.stopRunningThreadAria
+                        : status === "preparing"
+                          ? labels.preparingThreadAria
+                          : labels.runThreadAria
+                    }
+                    disabled={
+                      readonlyFromProps ||
+                      status === "preparing" ||
+                      (status === "idle" && !hasModel)
+                    }
+                    onClick={status === "running" ? handleStop : handleRun}
+                  >
+                    {status !== "idle" ? (
+                      <Spinner className="size-3" />
+                    ) : (
+                      <PlayIcon className="size-3" />
+                    )}
+                    {status === "running"
+                      ? labels.stopLabel
+                      : status === "preparing"
+                        ? labels.preparingLabel
+                        : labels.runLabel}
+                  </Button>
+                </Tooltip>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      className={cn(
+                        "border-none pr-1.5 pl-0.5 active:translate-y-0!",
+                        status === "running" && "disabled:opacity-100"
+                      )}
+                      aria-label={labels.runSettings}
+                      disabled={
+                        readonlyFromProps || status !== "idle" || !hasModel
+                      }
+                    >
+                      <ChevronDownIcon className="size-3" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="min-w-56">
+                    <DropdownMenuLabel>{labels.runSettings}</DropdownMenuLabel>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      onSelect={(event) => {
+                        event.preventDefault();
+                        setReactLoop(!reactLoop);
+                      }}
+                      className="justify-between gap-6"
+                    >
+                      {labels.enableReActLoop}
+                      <Switch
+                        size="sm"
+                        checked={reactLoop}
+                        className="pointer-events-none"
+                      />
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      // The ReAct loop implies auto-running tools, so this row
+                      // is forced on and locked while the loop is enabled.
+                      disabled={reactLoop}
+                      onSelect={(event) => {
+                        // Keep the menu open so the switch toggles in place.
+                        event.preventDefault();
+                        setAutoRunTools(!effectiveAutoRunTools);
+                      }}
+                      className="justify-between gap-6"
+                    >
+                      {labels.autoRunTools}
+                      <Switch
+                        size="sm"
+                        checked={effectiveAutoRunTools}
+                        disabled={reactLoop}
+                        className="pointer-events-none"
+                      />
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </ButtonGroup>
+              {headerActions}
+            </div>
+          </header>
+          <ResizablePanelGroup
+            className="flex min-h-0 grow"
+            orientation="horizontal"
+          >
+            <ResizablePanel className="pb-3" defaultSize="50%" minSize="300px">
+              <div className="flex size-full flex-col">
+                <div className="px-3">
+                  <div className={"flex w-full border-b py-2"}>
+                    <div className="text-muted-foreground w-20 shrink-0 text-sm">
+                      {labels.dialogs.sections.models}
+                    </div>
+                    <div className="flex grow items-center">
+                      <ModelConfigEditor readonly={readonly} />
+                    </div>
+                  </div>
+                  <div className={"flex w-full border-b py-2"}>
+                    <div className="text-muted-foreground w-20 shrink-0 text-sm">
+                      {labels.dialogs.sections.tools}
+                    </div>
+                    {/* Cap at ~3 chip rows (h-6 chips + gap-2.5), then scroll. */}
+                    <div className="flex max-h-24 grow items-start overflow-y-auto">
+                      <ToolListView readonly={readonly} />
+                    </div>
+                  </div>
+                  <div className={"flex w-full border-b py-2"}>
+                    <div className="text-muted-foreground w-20 shrink-0 text-sm">
+                      {labels.dialogs.sections.variables}
+                    </div>
+                    {/* Cap at ~3 chip rows (h-6 chips + gap-2.5), then scroll. */}
+                    <div className="flex max-h-24 grow items-start overflow-y-auto">
+                      <PromptVariablesListView
+                        disabled={readonly || systemPromptStreaming}
+                        active={active}
+                      />
+                    </div>
+                  </div>
+                </div>
+                <div className="flex min-h-0 w-full grow flex-col">
+                  <SystemPromptEditor
+                    className="size-full min-h-0 px-3"
+                    readonly={readonly}
+                    onStreamingChange={setSystemPromptStreaming}
+                  />
+                </div>
+              </div>
+            </ResizablePanel>
+            <ResizableHandle className="opacity-50 hover:opacity-100" />
+            <ResizablePanel minSize="300px">
+              <MessageListView
+                readonly={readonly}
+                compactImages={compactImages}
+                measurementsFrozen={!active && !presentational}
+              />
+            </ResizablePanel>
+          </ResizablePanelGroup>
+        </ResizablePanel>
+        <ResizableHandle />
+        <ResizablePanel
+          panelRef={runHistoryPanelRef}
+          collapsible
+          collapsedSize={0}
+          defaultSize={0}
+          minSize={RUN_HISTORY_PANEL_SIZE}
+          onResize={(size) => {
+            setHistoryOpen(size.inPixels > 0);
+          }}
+        >
+          <RunHistoryListView onClose={closeHistory} />
+        </ResizablePanel>
+      </ResizablePanelGroup>
+    </div>
+  );
+}

@@ -1,0 +1,61 @@
+# dependencies (bun install)
+node_modules
+
+# local home for testing
+.llm-space
+.omc
+
+# output
+out
+dist
+*.tgz
+
+# Playwright
+.playwright-mcp
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs
+*.log
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+
+# IntelliJ based IDEs
+.idea
+
+# Finder (MacOS) folder config
+.DS_Store
+
+# Skills
+.agents/kaizen-loop/audits/
+.agents/kaizen-loop/test-root/
+
+# Claude Code project MCP config (references a personal API key env var)
+.mcp.json
+
+# Loopany scheduled-agent workspace
+/loopany/
+
+# Python
+__pycache__
+
+# Local Claude Code git worktrees
+.claude/worktrees/
+
+/docs/plans/
+/docs/superpowers/plans/active/
+/docs/superpowers/plans/proposal/

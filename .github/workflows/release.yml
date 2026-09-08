@@ -1,0 +1,441 @@
+name: Release
+
+# Cut releases by pushing a `v*` tag (use `mise run release` / `release:canary`,
+# which bumps apps/desktop/package.json, commits and tags).
+# A `-canary` suffix in the tag selects the canary channel; otherwise stable.
+#
+# Jobs: meta (validate tag) → validate + builds in parallel → publish. The macOS
+# arm64 + x64 matrix signs, notarizes and smoke-tests both editions. Artifacts
+# land in two places:
+#   - the rolling `updates` release — the machine-readable update feed the
+#     in-app updater polls (`release.baseUrl` in electrobun.config.ts)
+#   - a versioned release per tag — DMGs for humans (static notes)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0-canary.1"
+        required: true
+
+permissions:
+  contents: write
+
+# Patch generation diffs against the currently published version, so releases
+# must not run concurrently.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      channel: ${{ steps.meta.outputs.channel }}
+    steps:
+      # Tag names may contain shell metacharacters — never interpolate them
+      # into `run:` scripts via ${{ }}; pass them through `env:` instead.
+      - name: Resolve tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$REF_NAME"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Validate tag and derive channel
+        id: meta
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          VERSION="${TAG#v}"
+          PKG_VERSION="$(jq -r .version apps/desktop/package.json)"
+          if [ "$VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tag $TAG does not match apps/desktop/package.json version $PKG_VERSION"
+            exit 1
+          fi
+          case "$VERSION" in
+            *-canary*) CHANNEL="canary" ;;
+            *) CHANNEL="stable" ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+
+  # Typecheck once on cheap Ubuntu (tsc output is architecture-independent),
+  # but do it alongside the expensive build matrix. Publish still requires this
+  # job, so the quality gate is unchanged; only the former ~70s serial wait is
+  # removed from the release critical path.
+  validate:
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      - uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+
+      - run: bun install --frozen-lockfile
+
+      - run: mise run typecheck
+
+  # Every tag builds both editions: the regular one drives the system WebView,
+  # the Performance one embeds Chromium (CEF). They are separate apps (own name,
+  # identifier and update feed — see electrobun.config.ts), so a user can run
+  # either or both.
+  build:
+    needs: meta
+    strategy:
+      matrix:
+        include:
+          - { runner: macos-15, arch: arm64, edition: regular }
+          - { runner: macos-15-intel, arch: x64, edition: regular }
+          - { runner: macos-15, arch: arm64, edition: performance }
+          - { runner: macos-15-intel, arch: x64, edition: performance }
+    runs-on: ${{ matrix.runner }}
+    # Generous: the Performance bundle carries a ~300 MB CEF framework, so its
+    # notarization upload and round-trip are far slower than the regular one's.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      # DMG imaging once ran the x64 Performance leg out of disk (`hdiutil
+      # create` → "No space left on device", v0.1.1-canary.3): the hosted
+      # runners' free space leaves too little margin over what the CEF build
+      # plus DMG staging need. Evict the biggest preinstalled things this job
+      # never touches — Simulator runtimes (tens of GB in a handful of disk
+      # images, so seconds to delete), their dyld caches, and the Homebrew
+      # download cache. The build itself only needs mise/bun and the Xcode
+      # command-line tools (codesign, hdiutil, stapler), none of which live
+      # there. Best-effort insurance on every leg: cleanup must never fail the
+      # release, and the df bookends put the reclaimed headroom in each log.
+      - name: Free runner disk space (hdiutil "No space left on device")
+        continue-on-error: true
+        run: |
+          df -h /
+          sudo xcrun simctl runtime delete all || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Caches || true
+          rm -rf "$(brew --cache)" || true
+          df -h /
+
+      # v4: reads mise.lock (installs the exact locked bun with checksum
+      # verification) and exports the full `mise env` (incl. PATH) into
+      # GITHUB_ENV — our [env] carries nothing beyond PATH.
+      - uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+
+      - run: bun install --frozen-lockfile
+
+      # electrobun images the app with `hdiutil create -srcfolder .dmg-staging`,
+      # which fails with "Resource busy" if Spotlight is still indexing that
+      # directory — it took out the x64 Performance build once, since a ~400 MB
+      # CEF bundle keeps `mds` busy far longer than the regular one. A CI runner
+      # has no use for a Spotlight index. Non-fatal: never let the mitigation
+      # itself fail the release.
+      - name: Disable Spotlight indexing (hdiutil "Resource busy")
+        run: sudo mdutil -a -i off || true
+
+      - name: Import signing certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          KEYCHAIN_PWD="$(uuidgen)"
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PWD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PWD" build.keychain
+          security import certificate.p12 -k build.keychain \
+            -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PWD" build.keychain
+          # Keep the keychain unlocked for long notarization waits (6h).
+          security set-keychain-settings -lut 21600 build.keychain
+          rm certificate.p12
+          IDENTITY="$(security find-identity -v -p codesigning build.keychain \
+            | grep 'Developer ID Application' | head -1 | sed -E 's/.*"(.+)"/\1/')"
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::no Developer ID Application identity in certificate"
+            exit 1
+          fi
+          echo "::add-mask::$IDENTITY"
+          echo "ELECTROBUN_DEVELOPER_ID=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Write App Store Connect API key
+        env:
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+        run: |
+          KEY_PATH="$RUNNER_TEMP/asc_api_key.p8"
+          printf '%s' "$ASC_API_KEY_P8" > "$KEY_PATH"
+          echo "ELECTROBUN_APPLEAPIKEYPATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Build, sign and notarize
+        env:
+          ELECTROBUN_APPLEAPIKEY: ${{ secrets.ASC_API_KEY_ID }}
+          ELECTROBUN_APPLEAPIISSUER: ${{ secrets.ASC_API_ISSUER_ID }}
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+          # The edition's only build-time switch: electrobun.config.ts forks the
+          # app name, identifier and update feed off it. Empty = regular edition.
+          LLM_SPACE_DESKTOP_RENDERER: ${{ matrix.edition == 'performance' && 'cef' || '' }}
+        run: mise run "build:$CHANNEL"
+
+      - name: Smoke test the signed app
+        working-directory: apps/desktop
+        env:
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          APP="$(find "build/$CHANNEL-macos-$ARCH" -maxdepth 1 -name '*.app' | head -1)"
+          if [ -z "$APP" ]; then
+            echo "::error::no .app bundle found in build/$CHANNEL-macos-$ARCH"
+            exit 1
+          fi
+          codesign --verify --deep --strict "$APP"
+          spctl -a -t exec -vv "$APP"
+          xcrun stapler validate "$APP"
+          # The bundle left in build/ is the self-extracting installer wrapper
+          # (the real app only exists inside the tar.zst): on first launch it
+          # swaps the real app into the same bundle path and relaunches it. This
+          # check must observe the *relaunched* app — a signed-but-corrupted
+          # binary dies instantly (electrobun#485 on x64), and this launch is the
+          # only regression gate on scripts/fix-x64-headerpad.ts, since codesign
+          # --verify / spctl / stapler all pass on a corrupted-but-signed binary.
+          #
+          # Do NOT go back to a fixed `sleep`: the extractor itself runs from
+          # $APP/Contents/MacOS/, so a bare pgrep on that path is satisfied by
+          # extraction still being in flight. The Performance edition's ~120 MB
+          # compressed payload takes ~33s to decompress on Apple silicon and
+          # longer on the Intel runner, so any sleep short enough to be
+          # tolerable is a lie.
+          # Poll for the swapped-in bundle instead (Resources/main.js only exists
+          # in the real app, never in the wrapper), then assert the real process.
+          open "$APP"
+          for _ in $(seq 1 150); do
+            [ -f "$APP/Contents/Resources/main.js" ] && break
+            sleep 1
+          done
+          if [ ! -f "$APP/Contents/Resources/main.js" ]; then
+            echo "::error::self-extraction never completed"
+            exit 1
+          fi
+          sleep 15
+          # Match the canonical main.js path passed by the launcher. The custom
+          # deep-link launcher resolves `MacOS/../Resources` before spawning Bun,
+          # unlike Electrobun's stock launcher; matching the old non-canonical
+          # path therefore reports a false failure even while Bun is alive.
+          MAIN_JS="$(cd "$APP/Contents/Resources" && pwd -P)/main.js"
+          pgrep -f "$MAIN_JS" > /dev/null || {
+            ps -ax -o pid=,command= | grep '[m]ain.js' || true
+            echo "::error::app did not stay alive after relaunch"
+            exit 1
+          }
+          pkill -f "$APP/Contents/" || true
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: artifacts-${{ matrix.edition }}-${{ matrix.arch }}
+          path: apps/desktop/artifacts/
+          if-no-files-found: error
+
+      - name: Clean up keychain
+        if: always()
+        run: security delete-keychain build.keychain || true
+
+  build-server:
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        target: [linux-x64, linux-arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      - uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+
+      - run: bun install --frozen-lockfile
+
+      - name: Build server package
+        run: bun --filter @llm-space/server pack -- --target "${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: server-artifacts-${{ matrix.target }}
+          path: apps/server/artifacts/
+          if-no-files-found: error
+
+  publish:
+    needs: [meta, validate, build, build-server]
+    runs-on: ubuntu-latest
+    # Uploading two editions' worth of artifacts; the Performance tarballs are
+    # an order of magnitude bigger than the regular ones.
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      # Editions must land in separate directories. Their update.json files are
+      # named `{channel}-{os}-{arch}-update.json` with no app name in them, so
+      # both editions produce the *same* file name — merging them into one
+      # directory would silently overwrite one edition's feed with the other's.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: artifacts-regular-*
+          path: artifacts/regular
+          merge-multiple: true
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: artifacts-performance-*
+          path: artifacts/performance
+          merge-multiple: true
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: server-artifacts-*
+          path: artifacts/server
+          merge-multiple: true
+
+      - name: Publish update feeds (one rolling release per edition)
+        run: |
+          publish_feed() {
+            local dir="$1" release="$2" title="$3"
+            # `gh release view` is the existence check, but it fails transiently
+            # often enough to matter: one flaky read sent us into `create`, which
+            # then died on "HTTP 422: Release.tag_name already exists" and took
+            # the whole release with it. So a failed `create` is only forgiven
+            # when a re-check proves the release really does exist — a genuine
+            # create failure still fails the job.
+            if ! gh release view "$release" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              gh release create "$release" --repo "$GITHUB_REPOSITORY" --prerelease \
+                --title "$title" \
+                --notes "Machine-readable update feed polled by the in-app updater. Download installers from the versioned releases instead." \
+                || gh release view "$release" --repo "$GITHUB_REPOSITORY" > /dev/null
+            fi
+            # Upload order is load-bearing: update.json is the update trigger and
+            # must land last, after the patches and tarballs it points at —
+            # across both architectures.
+            (
+              cd "$dir"
+              shopt -s nullglob
+              for f in *.patch; do
+                gh release upload "$release" "$f" --repo "$GITHUB_REPOSITORY" --clobber
+              done
+              gh release upload "$release" *.tar.zst --repo "$GITHUB_REPOSITORY" --clobber
+              gh release upload "$release" *update.json --repo "$GITHUB_REPOSITORY" --clobber
+            )
+          }
+          publish_feed artifacts/regular updates "Update feed"
+          publish_feed artifacts/performance updates-performance "Update feed (Performance edition)"
+
+      - name: Rename installers for the versioned release
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          # electrobun names DMGs `{channel}-macos-{arch}-{AppName}.dmg`
+          # (e.g. stable-macos-arm64-LLMSpace.dmg). Humans download these from the
+          # versioned release, so give them a stable, channel-free scheme:
+          #   LLMSpace-{vX.Y.Z}-macos-{arch}.dmg
+          #   LLMSpace-performance-{vX.Y.Z}-macos-{arch}.dmg
+          # version (the tag, so it keeps the `v`), os and arch are all lowercase.
+          # This runs AFTER the update feeds are published and only touches *.dmg,
+          # so the feed files (*.patch / *.tar.zst / *update.json) keep their
+          # electrobun names — the in-app updater fetches those verbatim.
+          VLOWER="$(echo "$TAG" | tr '[:upper:]' '[:lower:]')"
+          rename_dmgs() {
+            local dir="$1" prefix="$2"
+            shopt -s nullglob
+            for f in "$dir"/*.dmg; do
+              # Third dash-delimited field of the electrobun name is the arch.
+              arch="$(basename "$f" | sed -E 's/^[^-]+-macos-([^-]+)-.*/\1/')"
+              mv "$f" "$dir/$prefix-$VLOWER-macos-$arch.dmg"
+            done
+          }
+          rename_dmgs artifacts/regular LLMSpace
+          rename_dmgs artifacts/performance LLMSpace-performance
+
+      - name: Publish versioned release
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+          CHANNEL: ${{ needs.meta.outputs.channel }}
+        run: |
+          # Release notes = this version's hand-curated CHANGELOG.md section
+          # (so no commit/author dumps or "New Contributors" that --generate-notes
+          # would add) followed by the install blurb. The section is empty for
+          # prereleases with no entry (e.g. canary) — those fall back to
+          # install-only notes.
+          VERSION="${TAG#v}"
+          CHANGES="$(awk -v h="## [$VERSION]" '
+            index($0, h) == 1 { capture = 1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md | sed -e '/./,$!d')"
+          INSTALL="$(cat <<'EOF'
+          ## Install
+
+          Two editions. Install either, or both — they share the same `~/.llm-space` data, so switching keeps your threads and settings.
+
+          - **LLM Space** — uses the system WebView. Small download (~27 MB), light on memory and battery.
+          - **LLM Space Performance** — embeds its own rendering engine (~130 MB). Rendering stays consistent across macOS versions, and usually performs better.
+
+          Download a DMG below. Existing installs update in place.
+          EOF
+          )"
+          if [ -n "$CHANGES" ]; then
+            NOTES="$(printf "## What's Changed\n\n%s\n\n%s\n\n**Full changelog:** https://github.com/%s/blob/%s/CHANGELOG.md\n" "$CHANGES" "$INSTALL" "$GITHUB_REPOSITORY" "$TAG")"
+          else
+            NOTES="$INSTALL"
+          fi
+          PRERELEASE_ARGS=()
+          if [ "$CHANNEL" = "canary" ]; then
+            PRERELEASE_ARGS=(--prerelease)
+          fi
+          # Always (re)set the static notes — edit if the release already
+          # exists (e.g. a re-run, or a leftover from an earlier tag) so it
+          # never keeps stale auto-generated notes.
+          #
+          # This deliberately does NOT get publish_feed's flake guard. The
+          # exposure is inverted: a feed release always exists, so one flaky
+          # `view` there escalates to a fatal 422 on every run. A versioned
+          # release does not exist yet on a tag push, so a flaky `view` lands in
+          # the `create` branch it was headed for anyway — the normal path is
+          # flake-immune. Only "re-run of a tag whose release already exists" +
+          # "a transient failure in that same run" can 422 here, and it fails
+          # closed: the feeds are already published and nothing is corrupted, so
+          # a plain re-run fixes it. Don't "unify" these two — the guard would be
+          # dead weight.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$NOTES"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" --notes "$NOTES" "${PRERELEASE_ARGS[@]}"
+          fi
+          # Both editions' DMGs go to the same versioned release — no clash, the
+          # rename step above gives them distinct human-facing names (e.g.
+          # "LLMSpace-v4.0.1-macos-arm64.dmg" vs
+          # "LLMSpace-performance-v4.0.1-macos-arm64.dmg"). Only update.json is
+          # name-less, which is why the feeds above are kept apart.
+          gh release upload "$TAG" artifacts/regular/*.dmg artifacts/performance/*.dmg artifacts/server/*.tar.gz artifacts/server/*.sha256 \
+            --repo "$GITHUB_REPOSITORY" --clobber

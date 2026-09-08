@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Nothing else parses the workflows, so a malformed release.yml would only
+      # surface as "Invalid workflow file" *after* a version tag was pushed — a
+      # tag with no release behind it. Fail the PR instead. (A block scalar whose
+      # body drifts to column 0 is the easy way to get here.)
+      - name: Validate workflow YAML
+        run: python3 -c "import glob, yaml; [yaml.safe_load(open(f)) for f in glob.glob('.github/workflows/*.yml')]"
+
+      # Reads mise.lock: installs the exact locked bun with checksum
+      # verification (auto `mise install --locked`).
+      - uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+
+      - run: bun install --frozen-lockfile
+
+      # The built-in grep tool shells out to ripgrep. macOS release builds run
+      # on macOS runners, but this Ubuntu test runner does not include `rg`.
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install --yes ripgrep
+
+      - run: mise run test
+
+      - run: mise run lint
+
+      - run: mise run typecheck
+
+      # `vite build` otherwise runs only inside a release build, so a renderer
+      # change that breaks — or just outgrows the runner's V8 heap — stays
+      # invisible until a version tag is pushed, and takes the release with it.
+      # (That is exactly how v0.1.1-canary.0 died: 14701 modules OOMing a ~2 GB
+      # default heap. build:view raises it; this step is what keeps it honest.)
+      - run: bun --filter @llm-space/desktop build:view
+
+      # The static web app (landing page + shared-thread viewer) is only built by
+      # the Pages workflow on `main`, so a change that breaks its Vite build would
+      # otherwise stay invisible until it hit Pages. Build it on PRs too.
+      - run: bun --filter @llm-space/web build

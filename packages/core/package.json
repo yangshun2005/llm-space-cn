@@ -1,0 +1,29 @@
+{
+  "name": "@llm-space/core",
+  "version": "4.0.1",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts",
+    "./client": "./src/client/index.ts",
+    "./server": "./src/server/index.ts",
+    "./storage": "./src/storage/index.ts",
+    "./thread": "./src/thread/index.ts",
+    "./types": "./src/types/index.ts",
+    "./workflow": "./src/workflow/index.ts",
+    "./generator": "./src/generator/index.ts",
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "catalog:",
+    "@earendil-works/pi-ai": "catalog:",
+    "best-effort-json-parser": "^1.4.1",
+    "nunjucks": "^3.2.4",
+    "parse-sse": "^0.1.0",
+    "typebox": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@types/nunjucks": "^3.2.6"
+  }
+}

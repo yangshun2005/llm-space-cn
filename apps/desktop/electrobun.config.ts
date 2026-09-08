@@ -1,0 +1,107 @@
+import type { ElectrobunConfig } from "electrobun";
+
+import packageJson from "./package.json";
+import { resolveDeepLinkScheme } from "./src/shared/deep-link-scheme";
+
+// LLM_SPACE_DESKTOP_RENDERER=cef selects the Performance edition: it embeds
+// Chromium (CEF) instead of driving the system WebView. It ships as a separate
+// app — own name, own identifier, own update feed — so it installs alongside
+// the regular edition. Both read the same ~/.llm-space data directory
+// (getLlmSpaceHomePath() is name-independent), so switching editions keeps
+// threads, model config and API keys.
+const isPerformanceEdition = Bun.env.LLM_SPACE_DESKTOP_RENDERER === "cef";
+
+// Opt-in only. A CDP port left open in a shipped build lets any local process
+// drive the renderer and read whatever is on screen — `dev:cef` passes the
+// port explicitly, release builds never do.
+const cdpPort = Bun.env.LLM_SPACE_DESKTOP_CDP_PORT;
+const deepLinkScheme = resolveDeepLinkScheme(
+  Bun.env.LLM_SPACE_DEEP_LINK_SCHEME
+);
+
+// Local-testing escape hatches — CI leaves all of these unset:
+//   LLM_SPACE_SKIP_SIGNING=1  → unsigned canary/stable build (no Apple creds
+//                               needed; locally-built apps have no quarantine
+//                               flag, so Gatekeeper doesn't mind)
+//   LLM_SPACE_SKIP_NOTARIZE=1 → sign but skip notarization; pair with
+//                               ELECTROBUN_DEVELOPER_ID="-" for a zero-cost
+//                               ad-hoc signed build that still exercises the
+//                               full signing path (entitlements, hardened
+//                               runtime, the x64 headerpad hook)
+//   LLM_SPACE_UPDATE_BASE_URL → point the update feed at a local static
+//                               server to exercise the auto-update loop
+const skipSigning = Boolean(Bun.env.LLM_SPACE_SKIP_SIGNING);
+const skipNotarize = skipSigning || Boolean(Bun.env.LLM_SPACE_SKIP_NOTARIZE);
+
+// Each edition needs its own feed. update.json is named `{channel}-{os}-{arch}`
+// and carries no app name, so both editions would otherwise fight over
+// `stable-macos-arm64-update.json` inside the same GitHub release.
+const RELEASE_DOWNLOADS =
+  "https://github.com/deer-flow/llm-space/releases/download";
+const updateBaseUrl =
+  Bun.env.LLM_SPACE_UPDATE_BASE_URL ??
+  `${RELEASE_DOWNLOADS}/${isPerformanceEdition ? "updates-performance" : "updates"}`;
+
+export default {
+  app: {
+    // Name and identifier both fork per edition: the name keeps the artifact
+    // file names apart (tarball/DMG are named after it), the identifier keeps
+    // macOS from treating the two apps as the same install.
+    name: isPerformanceEdition ? "LLM Space Performance" : "LLM Space",
+    identifier: isPerformanceEdition
+      ? "tech.deerflow.llm-space.performance"
+      : "tech.deerflow.llm-space",
+    // Single source of truth for the app version; release tags must match
+    // (CI validates `v{version}` against the pushed tag).
+    version: packageJson.version,
+    // Dev scripts explicitly select `llm-space-dev`; packaged canary/stable
+    // builds leave the variable unset and continue to own `llm-space`.
+    urlSchemes: [deepLinkScheme],
+  },
+  build: {
+    // Vite builds to dist/, we copy from there. `assets/` holds hashed,
+    // import-ed assets; `images/` (and anything else under Vite's `public/`)
+    // is referenced by absolute path (e.g. `/images/onboard.png`) and must be
+    // copied too, or it 404s in a packaged build.
+    copy: {
+      "dist/index.html": "views/mainview/index.html",
+      "dist/assets": "views/mainview/assets",
+      "dist/images": "views/mainview/images",
+      "../../packages/runtime/src/plugins/plugin-runner.ts": "plugin-runner.ts",
+    },
+    // Ignore Vite output in watch mode — HMR handles view rebuilds separately
+    watchIgnore: ["dist/**"],
+    mac: {
+      // Signing/notarization run only on canary/stable builds and require the
+      // ELECTROBUN_DEVELOPER_ID + App Store Connect API key env vars (CI).
+      codesign: !skipSigning,
+      notarize: !skipNotarize,
+      bundleCEF: isPerformanceEdition,
+      ...(isPerformanceEdition ? { defaultRenderer: "cef" as const } : {}),
+      ...(isPerformanceEdition && cdpPort
+        ? { chromiumFlags: { "remote-debugging-port": cdpPort } }
+        : {}),
+      icons: "icon.iconset",
+    },
+    linux: {
+      bundleCEF: false,
+    },
+    win: {
+      bundleCEF: false,
+    },
+  },
+  scripts: {
+    // The inner-bundle hook installs the macOS launcher that preserves cold
+    // deep links, then applies the x64 headerpad workaround. The wrapper hook
+    // only needs the headerpad fix. Both run before their codesign step.
+    postBuild: "scripts/post-build.ts",
+    postWrap: "scripts/fix-x64-headerpad.ts",
+  },
+  release: {
+    // Burned into every shipped bundle — the updater fetches
+    // `{baseUrl}/{channel}-{os}-{arch}-update.json` from here. Within an
+    // edition both channels share one rolling GitHub release (artifacts are
+    // channel-prefixed); the two editions get one rolling release each.
+    baseUrl: updateBaseUrl,
+  },
+} satisfies ElectrobunConfig;

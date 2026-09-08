@@ -1,0 +1,653 @@
+"use client";
+
+import {
+  uuid,
+  type FileNode,
+  type Message,
+  type Thread,
+  type Tool,
+} from "@llm-space/core";
+import {
+  LOCAL_STORAGE_KEYS,
+  readLocalStorage,
+  writeLocalStorage,
+  type LocalStorageKey,
+} from "@llm-space/ui/lib/local-storage";
+import {
+  basename,
+  joinPath,
+  normalizeThreadForPath,
+  parentOf,
+  threadTitleFromPath,
+  uniqueThreadFileName,
+} from "@llm-space/ui/lib/thread-file";
+import { useQueries, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { toast } from "sonner";
+import { z } from "zod";
+
+import { createFileSystemClient } from "@/client";
+import type { RuntimeId } from "@/shared/runtime";
+
+import {
+  runFileMutationWithGuard,
+  type AcquireFileMutation,
+} from "./file-mutation-guard";
+import { runGuardedFileMove } from "./guarded-file-move";
+
+/** Query-key factory for a directory listing. */
+export const fsKeys = {
+  ls: (runtimeId: RuntimeId, path: string) =>
+    ["fs", runtimeId, "ls", path] as const,
+};
+
+/**
+ * Deepest directory level whose expanded state is persisted across sessions.
+ * Level 1 is a direct child of the root, level 2 its child, and so on.
+ */
+const MAX_PERSISTED_DEPTH = 5;
+const PersistedExpandedPathsSchema = z.array(z.string());
+
+/** Path depth (segment count), used to order ancestors before descendants. */
+function _depth(path: string): number {
+  return path.split("/").length;
+}
+
+/**
+ * Read the persisted expanded paths, sorted shallowest-first so that a parent
+ * is always restored (and its listing loaded) before its descendants. Returns
+ * `[]` when storage is unavailable or malformed.
+ */
+function _persistedExpandedKey(runtimeId: RuntimeId): LocalStorageKey {
+  return `${LOCAL_STORAGE_KEYS.fileTreeExpanded}:${runtimeId}`;
+}
+
+function _loadPersistedExpanded(runtimeId: RuntimeId): string[] {
+  try {
+    const raw = readLocalStorage(_persistedExpandedKey(runtimeId));
+    if (!raw) return [];
+    const parsed = PersistedExpandedPathsSchema.parse(JSON.parse(raw));
+    return parsed.sort((a, b) => _depth(a) - _depth(b));
+  } catch {
+    return [];
+  }
+}
+
+/** Persist the expanded paths, ignoring any storage failure. */
+function _savePersistedExpanded(runtimeId: RuntimeId, paths: string[]): void {
+  writeLocalStorage(_persistedExpandedKey(runtimeId), JSON.stringify(paths));
+}
+
+/**
+ * Pick an unused "untitled" name in a directory: `untitled<ext>`, then
+ * `untitled-1<ext>`, `untitled-2<ext>`, … `index` is 0 for the bare name.
+ */
+function uniqueUntitled(
+  names: Set<string>,
+  ext: string
+): { name: string; index: number } {
+  if (!names.has(`untitled${ext}`)) return { name: `untitled${ext}`, index: 0 };
+  let n = 1;
+  while (names.has(`untitled-${n}${ext}`)) n++;
+  return { name: `untitled-${n}${ext}`, index: n };
+}
+
+/**
+ * The collision-free `_copy` name for duplicating `name` in a directory:
+ * `foo_copy`, then `foo_copy_2`, `foo_copy_3`, … A `.json` extension (the only
+ * file kind shown in the tree) is preserved on the stem.
+ */
+function uniqueCopyName(names: Set<string>, name: string): string {
+  const ext = name.endsWith(".json") ? ".json" : "";
+  const stem = ext ? name.slice(0, -ext.length) : name;
+  let candidate = `${stem}_copy${ext}`;
+  let n = 2;
+  while (names.has(candidate)) candidate = `${stem}_copy_${n++}${ext}`;
+  return candidate;
+}
+
+function isSelfOrDescendant(ancestor: string, path: string): boolean {
+  return path === ancestor || path.startsWith(`${ancestor}/`);
+}
+
+/** Match the server's ordering: directories first, then name ascending. */
+function sortNodes(nodes: FileNode[]): FileNode[] {
+  return [...nodes].sort((a, b) => {
+    if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+/**
+ * Create a blank thread for users who want an empty canvas. The title must come
+ * from the destination path so the on-disk file name and thread title stay in
+ * sync from the first write.
+ */
+function _createBlankThread(title: string): Thread {
+  return {
+    title,
+    context: {
+      messages: [
+        { id: uuid(), role: "user", content: [{ type: "text", text: "" }] },
+      ],
+    },
+  };
+}
+
+/**
+ * Create a user-owned copy of a prompt example. The prompt becomes the system
+ * prompt, while the user message stays empty so the example behaves as a ready
+ * starting point rather than a pre-run transcript.
+ */
+function _createThreadFromPromptExample(
+  title: string,
+  systemPrompt: string,
+  tools?: Tool[],
+  messages?: Message[],
+  textVariables?: Record<string, string>
+): Thread {
+  return {
+    title,
+    context: {
+      systemPrompt,
+      tools,
+      messages: messages ?? [
+        { id: uuid(), role: "user", content: [{ type: "text", text: "" }] },
+      ],
+      ...(textVariables
+        ? {
+            variableVariants: {
+              active: "default",
+              variants: { default: textVariables },
+            },
+          }
+        : {}),
+    },
+  };
+}
+
+/** A name collision surfaced by {@link FileSystemTree.move}. */
+export interface MoveConflict {
+  /** The colliding base name in the destination directory. */
+  name: string;
+  /** Whether the existing entry being overwritten is a directory. */
+  isDir: boolean;
+}
+
+export interface FileSystemTree {
+  /** Cached listing for each loaded directory path. */
+  nodesByPath: Map<string, FileNode[]>;
+  /** Directory paths whose listing is currently loading. */
+  loadingByPath: Set<string>;
+  /** Whether the root listing is still loading. */
+  isRootLoading: boolean;
+  /** Expanded directory paths (mirrors the tree's open state). */
+  expanded: Set<string>;
+  toggle: (path: string) => void;
+  /** Expand a directory (idempotent; does not collapse). */
+  expand: (path: string) => void;
+  /** Re-fetch all loaded directory listings. */
+  refresh: () => void;
+  /** Create an auto-named `untitled` folder under `parent`; returns its path. */
+  createFolder: (parent: string) => Promise<string | null>;
+  /** Create an auto-named thread under `parent`; returns its path. */
+  createFile: (parent: string) => Promise<string | null>;
+  /** Create a thread from a built-in prompt example; returns its path. */
+  createFileFromPromptExample: (
+    parent: string,
+    example: {
+      fileStem: string;
+      systemPrompt: string;
+      tools?: Tool[];
+      messages?: Message[];
+      textVariables?: Record<string, string>;
+    }
+  ) => Promise<string | null>;
+  /** Delete a file or directory; resolves to whether it succeeded. */
+  remove: (path: string) => Promise<boolean>;
+  /** Copy a file/directory beside itself as `<name>_copy`; returns the new path. */
+  duplicate: (path: string) => Promise<string | null>;
+  /** Reveal a file/directory in the OS file manager (Finder/Explorer). */
+  reveal: (path: string) => Promise<void>;
+  /**
+   * Move into `destDir`; resolves to the new path, or null on no-op/error/cancel.
+   * When an entry of the same name already exists in `destDir`, `confirmOverwrite`
+   * is consulted — resolving `false` cancels the move, `true` replaces the
+   * existing entry (moved to the trash first). Without a callback, a collision
+   * cancels.
+   */
+  move: (
+    src: string,
+    destDir: string,
+    opts?: { confirmOverwrite?: (info: MoveConflict) => Promise<boolean> }
+  ) => Promise<string | null>;
+  /** Rename within the same directory; resolves to the new path, or null. */
+  rename: (path: string, newBase: string) => Promise<string | null>;
+}
+
+export interface FileMutationReconciliation {
+  onMove?: (
+    from: string,
+    to: string,
+    runtimeId: RuntimeId
+  ) => void | Promise<void>;
+  onRemove?: (path: string, runtimeId: RuntimeId) => void | Promise<void>;
+}
+
+/**
+ * Owns all server state for the file tree via React Query: one lazily-enabled
+ * `ls` query per expanded directory (root always loaded), plus mutations that
+ * invalidate the affected directories. `move` is optimistic with rollback.
+ */
+export function useFileSystemTree(
+  runtimeId: RuntimeId,
+  acquireMutation?: AcquireFileMutation,
+  reconciliation: FileMutationReconciliation = {}
+): FileSystemTree {
+  const qc = useQueryClient();
+  const fs = useMemo(() => createFileSystemClient(runtimeId), [runtimeId]);
+  // Restore the directories that were open last session (shallowest-first, so
+  // each parent loads before its children); entries whose directory no longer
+  // exists are pruned once their parent's listing loads.
+  const [expanded, setExpanded] = useState<Set<string>>(
+    () => new Set(_loadPersistedExpanded(runtimeId))
+  );
+
+  useEffect(() => {
+    setExpanded(new Set(_loadPersistedExpanded(runtimeId)));
+  }, [runtimeId]);
+
+  // Root ("") is always queried; each expanded directory adds one query.
+  const paths = useMemo(() => ["", ...expanded], [expanded]);
+  const results = useQueries({
+    queries: paths.map((path) => ({
+      queryKey: fsKeys.ls(runtimeId, path),
+      queryFn: () => fs.ls(path),
+    })),
+  });
+
+  const nodesByPath = useMemo(() => {
+    const map = new Map<string, FileNode[]>();
+    paths.forEach((path, i) => {
+      const data = results[i]?.data;
+      if (data) map.set(path, data);
+    });
+    return map;
+  }, [paths, results]);
+
+  const loadingByPath = useMemo(() => {
+    const set = new Set<string>();
+    paths.forEach((path, i) => {
+      if (results[i]?.isLoading) set.add(path);
+    });
+    return set;
+  }, [paths, results]);
+
+  // Persist expanded directories up to MAX_PERSISTED_DEPTH, shallowest-first so
+  // the restore order opens ancestors before descendants.
+  useEffect(() => {
+    _savePersistedExpanded(
+      runtimeId,
+      [...expanded]
+        .filter((p) => _depth(p) <= MAX_PERSISTED_DEPTH)
+        .sort((a, b) => _depth(a) - _depth(b))
+    );
+  }, [expanded, runtimeId]);
+
+  // Prune restored directories that no longer exist. A directory is dropped when
+  // either its parent fell away (ancestor pruned/collapsed) or its parent's
+  // listing has loaded and no longer lists it — both ignored silently, never
+  // surfaced as an error. Walking shallowest-first lets a removed ancestor
+  // cascade to its descendants within a single pass.
+  useEffect(() => {
+    setExpanded((prev) => {
+      const ordered = [...prev].sort((a, b) => _depth(a) - _depth(b));
+      const next = new Set(prev);
+      let changed = false;
+      for (const path of ordered) {
+        const parent = parentOf(path);
+        if (parent !== "" && !next.has(parent)) {
+          next.delete(path);
+          changed = true;
+          continue;
+        }
+        const siblings = nodesByPath.get(parent);
+        // Undefined ⇒ the parent's listing is still loading; leave it for now.
+        if (
+          siblings &&
+          !siblings.some((n) => n.path === path && n.type === "directory")
+        ) {
+          next.delete(path);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [nodesByPath]);
+
+  const toggle = useCallback((path: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }, []);
+
+  const expand = useCallback((path: string) => {
+    setExpanded((prev) => (prev.has(path) ? prev : new Set(prev).add(path)));
+  }, []);
+
+  const refresh = useCallback(() => {
+    void qc.invalidateQueries({ queryKey: ["fs", runtimeId, "ls"] });
+  }, [qc, runtimeId]);
+
+  const createFolder = useCallback(
+    async (parent: string): Promise<string | null> => {
+      let path: string;
+      try {
+        const names = new Set((await fs.ls(parent)).map((n) => n.name));
+        const { name } = uniqueUntitled(names, "");
+        path = joinPath(parent, name);
+        await fs.mkdir(path);
+      } catch (err) {
+        toast.error((err as Error).message);
+        return null;
+      }
+      void qc.invalidateQueries({ queryKey: fsKeys.ls(runtimeId, parent) });
+      return path;
+    },
+    [qc, fs, runtimeId]
+  );
+
+  const createFile = useCallback(
+    async (parent: string): Promise<string | null> => {
+      let path: string;
+      try {
+        const names = new Set((await fs.ls(parent)).map((n) => n.name));
+        const name = uniqueUntitled(names, ".json").name;
+        path = joinPath(parent, name);
+        const title = threadTitleFromPath(path);
+        // Model-less by default; the UI resolves a fallback model at run time.
+        await fs.write(path, { ..._createBlankThread(title), runtimeId });
+      } catch (err) {
+        toast.error((err as Error).message);
+        return null;
+      }
+      void qc.invalidateQueries({ queryKey: fsKeys.ls(runtimeId, parent) });
+      return path;
+    },
+    [qc, fs, runtimeId]
+  );
+
+  const createFileFromPromptExample = useCallback(
+    async (
+      parent: string,
+      example: {
+        fileStem: string;
+        systemPrompt: string;
+        tools?: Tool[];
+        messages?: Message[];
+        textVariables?: Record<string, string>;
+      }
+    ): Promise<string | null> => {
+      let path: string;
+      try {
+        const names = new Set((await fs.ls(parent)).map((n) => n.name));
+        const name = uniqueThreadFileName(names, example.fileStem);
+        path = joinPath(parent, name);
+        const title = threadTitleFromPath(path);
+        await fs.write(path, {
+          ..._createThreadFromPromptExample(
+            title,
+            example.systemPrompt,
+            example.tools,
+            example.messages,
+            example.textVariables
+          ),
+          runtimeId,
+        });
+      } catch (err) {
+        toast.error((err as Error).message);
+        return null;
+      }
+      void qc.invalidateQueries({ queryKey: fsKeys.ls(runtimeId, parent) });
+      return path;
+    },
+    [qc, fs, runtimeId]
+  );
+
+  const remove = useCallback(
+    (path: string): Promise<boolean> =>
+      runFileMutationWithGuard({
+        acquireMutation,
+        paths: [path],
+        runtimeId,
+        action: "moving this item to the trash",
+        blockedResult: false,
+        mutate: async () => {
+          try {
+            await fs.rm(path);
+          } catch (err) {
+            toast.error((err as Error).message);
+            // The delete may still have landed even though it reported failure
+            // (e.g. the RPC timed out while the OS waited on a permission
+            // prompt), so re-fetch rather than leaving a stale entry in the tree.
+            void qc.invalidateQueries({
+              queryKey: fsKeys.ls(runtimeId, parentOf(path)),
+            });
+            return false;
+          }
+          // Prune the removed subtree from the expanded set.
+          setExpanded((prev) => {
+            const next = new Set(prev);
+            for (const p of prev) {
+              if (isSelfOrDescendant(path, p)) next.delete(p);
+            }
+            return next;
+          });
+          void qc.invalidateQueries({
+            queryKey: fsKeys.ls(runtimeId, parentOf(path)),
+          });
+          return true;
+        },
+        reconcile: (removed) =>
+          removed ? reconciliation.onRemove?.(path, runtimeId) : undefined,
+      }),
+    [acquireMutation, qc, fs, reconciliation, runtimeId]
+  );
+
+  const duplicate = useCallback(
+    async (path: string): Promise<string | null> => {
+      const parent = parentOf(path);
+      let dest: string;
+      try {
+        const names = new Set((await fs.ls(parent)).map((n) => n.name));
+        dest = joinPath(parent, uniqueCopyName(names, basename(path)));
+        await fs.cp(path, dest);
+      } catch (err) {
+        toast.error((err as Error).message);
+        return null;
+      }
+      void qc.invalidateQueries({ queryKey: fsKeys.ls(runtimeId, parent) });
+      return dest;
+    },
+    [qc, fs, runtimeId]
+  );
+
+  const reveal = useCallback(
+    async (path: string): Promise<void> => {
+      try {
+        await fs.reveal(path);
+      } catch (err) {
+        toast.error((err as Error).message);
+      }
+    },
+    [fs]
+  );
+
+  const move = useCallback(
+    async (
+      src: string,
+      destDir: string,
+      opts?: { confirmOverwrite?: (info: MoveConflict) => Promise<boolean> }
+    ): Promise<string | null> => {
+      if (!src) return null;
+      if (isSelfOrDescendant(src, destDir)) {
+        toast.error("Cannot move a folder into itself.");
+        return null;
+      }
+      const srcParent = parentOf(src);
+      if (srcParent === destDir) return null; // no-op
+
+      const name = basename(src);
+      const dest = joinPath(destDir, name);
+      const srcKey = fsKeys.ls(runtimeId, srcParent);
+      const destKey = fsKeys.ls(runtimeId, destDir);
+
+      try {
+        return await runGuardedFileMove({
+          acquireMutation,
+        paths: [src, dest],
+        runtimeId,
+        action: "moving this item",
+        blockedResult: null,
+        // Collision inspection lives inside the source/destination lease. A
+        // listing taken before acquisition can become stale and silently turn
+        // an ordinary move into an overwrite.
+          detectConflict: async (): Promise<MoveConflict | null> => {
+            const destNodes = await fs.ls(destDir);
+            const clash = destNodes.find((node) => node.name === name);
+            return clash
+              ? { name, isDir: clash.type === "directory" }
+              : null;
+          },
+          confirmConflict: opts?.confirmOverwrite,
+          mutate: async (overwrite) => {
+          await Promise.all([
+            qc.cancelQueries({ queryKey: srcKey }),
+            qc.cancelQueries({ queryKey: destKey }),
+          ]);
+          const prevSrc = qc.getQueryData<FileNode[]>(srcKey);
+          const prevDest = qc.getQueryData<FileNode[]>(destKey);
+          const moved = prevSrc?.find((n) => n.path === src);
+
+          // Optimistically remove from the source and add to the destination,
+          // dropping any same-named entry there (the one being overwritten).
+          if (prevSrc) {
+            qc.setQueryData<FileNode[]>(
+              srcKey,
+              prevSrc.filter((n) => n.path !== src)
+            );
+          }
+          if (moved && prevDest) {
+            qc.setQueryData<FileNode[]>(
+              destKey,
+              sortNodes([
+                ...prevDest.filter((n) => n.name !== name),
+                { ...moved, path: dest, name },
+              ])
+            );
+          }
+
+          let ok = true;
+          try {
+            // Replacing an existing entry: send it to the trash first, so the
+            // move succeeds for directories too.
+            if (overwrite) {
+              await fs.rm(dest);
+            }
+            await fs.mv(src, dest);
+          } catch (err) {
+            // Roll back.
+            if (prevSrc) qc.setQueryData(srcKey, prevSrc);
+            if (prevDest) qc.setQueryData(destKey, prevDest);
+            toast.error((err as Error).message);
+            ok = false;
+          } finally {
+            void qc.invalidateQueries({ queryKey: srcKey });
+            void qc.invalidateQueries({ queryKey: destKey });
+          }
+          // Moving a subtree invalidates the expanded paths under it.
+          if (ok) {
+            setExpanded((prev) => {
+              const next = new Set(prev);
+              for (const p of prev) {
+                if (isSelfOrDescendant(src, p)) next.delete(p);
+              }
+              return next;
+            });
+          }
+          return ok ? dest : null;
+          },
+          reconcile: (to) =>
+            to ? reconciliation.onMove?.(src, to, runtimeId) : undefined,
+        });
+      } catch (err) {
+        toast.error((err as Error).message);
+        return null;
+      }
+    },
+    [acquireMutation, qc, fs, reconciliation, runtimeId]
+  );
+
+  const rename = useCallback(
+    async (path: string, newBase: string): Promise<string | null> => {
+      const dest = joinPath(parentOf(path), newBase);
+      if (dest === path) return null;
+      return runFileMutationWithGuard({
+        acquireMutation,
+        paths: [path, dest],
+        runtimeId,
+        action: "renaming this item",
+        blockedResult: null,
+        mutate: async () => {
+          try {
+            await fs.mv(path, dest);
+            if (dest.endsWith(".json")) {
+              const thread = await fs.read(dest);
+              await fs.write(dest, normalizeThreadForPath(thread, dest));
+            }
+          } catch (err) {
+            toast.error((err as Error).message);
+            return null;
+          }
+          // The renamed subtree's old paths are no longer valid query keys;
+          // collapse it so its children reload under the new path next time.
+          setExpanded((prev) => {
+            const next = new Set(prev);
+            for (const p of prev) {
+              if (isSelfOrDescendant(path, p)) next.delete(p);
+            }
+            return next;
+          });
+          void qc.invalidateQueries({
+            queryKey: fsKeys.ls(runtimeId, parentOf(path)),
+          });
+          return dest;
+        },
+        reconcile: (to) =>
+          to ? reconciliation.onMove?.(path, to, runtimeId) : undefined,
+      });
+    },
+    [acquireMutation, qc, fs, reconciliation, runtimeId]
+  );
+
+  return {
+    nodesByPath,
+    loadingByPath,
+    isRootLoading: loadingByPath.has(""),
+    expanded,
+    toggle,
+    expand,
+    refresh,
+    createFolder,
+    createFile,
+    createFileFromPromptExample,
+    remove,
+    duplicate,
+    reveal,
+    move,
+    rename,
+  };
+}

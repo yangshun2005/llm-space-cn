@@ -1,0 +1,185 @@
+import type { ImageContent } from "@llm-space/core";
+import { ImageIcon, XIcon } from "lucide-react";
+import React, { useCallback, useState } from "react";
+
+import { Tooltip } from "@llm-space/ui/components/tooltip";
+import { cn } from "@llm-space/ui/lib/utils";
+import { Button } from "@llm-space/ui/ui/button";
+import { Dialog, DialogContent, DialogTitle } from "@llm-space/ui/ui/dialog";
+
+import { usePlaygroundLabels } from "../playground-labels";
+import { useThreadStoreActions } from "../stores";
+
+import { useImageDisplay } from "./image-display-context";
+
+const FRAME_SIZE_PX = 192; // size-48
+
+function _ImageContentView({
+  image,
+  readonly,
+  onRemove,
+  className,
+  compact,
+  imageNumber,
+}: {
+  image: ImageContent;
+  readonly?: boolean;
+  onRemove?: () => void;
+  className?: string;
+  /** Render as a `[Image #N]` placeholder that opens the preview on click. */
+  compact?: boolean;
+  imageNumber?: number;
+}) {
+  const { dialogs } = usePlaygroundLabels();
+  const labels = dialogs.tooltips;
+  const [fit, setFit] = useState<"contain" | "cover">("contain");
+  const [previewOpen, setPreviewOpen] = useState(false);
+
+  const imageSrc = `data:${image.mimeType};base64,${image.data}`;
+
+  const handleLoad = useCallback(
+    (event: React.SyntheticEvent<HTMLImageElement>) => {
+      const { naturalWidth, naturalHeight } = event.currentTarget;
+      setFit(
+        naturalWidth <= FRAME_SIZE_PX && naturalHeight <= FRAME_SIZE_PX
+          ? "contain"
+          : "cover"
+      );
+    },
+    []
+  );
+
+  const handleRemove = useCallback(
+    (event: React.MouseEvent) => {
+      event.stopPropagation();
+      onRemove?.();
+    },
+    [onRemove]
+  );
+
+  const handleOpenPreview = useCallback(() => {
+    setPreviewOpen(true);
+  }, []);
+
+  return (
+    <>
+      {compact ? (
+        <button
+          type="button"
+          onClick={handleOpenPreview}
+          className={cn(
+            "text-muted-foreground hover:text-foreground bg-muted/40 hover:bg-muted inline-flex shrink-0 cursor-pointer items-center gap-1.5 rounded-md border px-2 py-1 font-mono text-xs transition-colors",
+            className
+          )}
+          aria-label={labels.openImagePreview}
+        >
+          <ImageIcon className="size-3.5" />
+          [Image #{imageNumber}]
+        </button>
+      ) : (
+        <div
+          className={cn(
+            "group/image relative flex size-48 shrink-0 cursor-pointer items-center justify-center overflow-hidden rounded-md border shadow",
+            className
+          )}
+          onClick={handleOpenPreview}
+          role="button"
+          tabIndex={0}
+          aria-label={labels.openImagePreview}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              handleOpenPreview();
+            }
+          }}
+        >
+          <img
+            src={imageSrc}
+            alt=""
+            onLoad={handleLoad}
+            className={cn(
+              fit === "cover"
+                ? "size-full object-cover"
+                : "max-h-full max-w-full object-contain"
+            )}
+          />
+          {!readonly && onRemove && (
+            <Tooltip content={labels.removeImage}>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                className="bg-background/80 absolute top-1 right-1 rounded-full border opacity-0 transition-opacity group-hover/image:opacity-100"
+                aria-label={labels.removeImage}
+                onClick={handleRemove}
+              >
+                <XIcon className="size-4" />
+              </Button>
+            </Tooltip>
+          )}
+        </div>
+      )}
+
+      <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
+        <DialogContent
+          className="top-0 left-0 flex h-dvh max-h-none w-dvw max-w-none translate-x-0 translate-y-0 cursor-zoom-out items-center justify-center rounded-none border-0 bg-transparent p-0 shadow-none ring-0 sm:max-w-none"
+          showCloseButton
+          onClick={() => setPreviewOpen(false)}
+        >
+          <DialogTitle className="sr-only">Image preview</DialogTitle>
+          <img
+            src={imageSrc}
+            alt=""
+            className="max-h-[95vh] max-w-[95vw] cursor-default object-contain"
+            onClick={(event) => event.stopPropagation()}
+          />
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+export const ImageContentView = React.memo(_ImageContentView);
+
+function _ImageContentList({
+  messageId,
+  images,
+  readonly,
+  className,
+}: {
+  messageId: string;
+  images: { content: ImageContent; contentIndex: number }[];
+  readonly?: boolean;
+  className?: string;
+}) {
+  const { removeMessageImageContent } = useThreadStoreActions();
+  const { compact, numberOf } = useImageDisplay();
+
+  if (images.length === 0) {
+    return null;
+  }
+
+  return (
+    <div
+      className={cn(
+        "flex w-full flex-wrap px-3 pt-2",
+        compact ? "gap-1.5" : "gap-3",
+        className
+      )}
+    >
+      {images.map(({ content, contentIndex }) => (
+        <ImageContentView
+          key={`${content.mimeType}-${contentIndex}`}
+          image={content}
+          readonly={readonly}
+          compact={compact}
+          imageNumber={numberOf(messageId, contentIndex)}
+          onRemove={() => {
+            removeMessageImageContent(messageId, contentIndex);
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
+export const ImageContentList = React.memo(_ImageContentList);

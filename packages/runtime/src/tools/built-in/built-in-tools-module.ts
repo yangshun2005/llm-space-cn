@@ -1,0 +1,92 @@
+import type { RuntimeModule } from "../runtime-module";
+
+import { calculatorBuiltInTools } from "./calculator";
+import { dateDifferenceBuiltInTools } from "./date-difference";
+import {
+  createExecCodeBuiltInTools,
+  ExecCodeSessionManager,
+} from "./exec-code";
+import { createFsBuiltInTools } from "./fs";
+import type { FsBuiltInToolsDependencies } from "./fs";
+import { createMediaBuiltInTools } from "./media";
+import type { MediaBuiltInToolsDependencies } from "./media";
+import { miscBuiltInTools } from "./misc";
+import { createSpeechBuiltInTools, MacSpeechManager } from "./speech";
+import { createWebBuiltInTools } from "./web";
+import type { WebBuiltInToolsDependencies } from "./web";
+
+export type BuiltInToolsModuleDependencies = FsBuiltInToolsDependencies &
+  WebBuiltInToolsDependencies &
+  MediaBuiltInToolsDependencies;
+
+export function createBuiltInToolsModule(
+  dependencies: BuiltInToolsModuleDependencies
+): RuntimeModule {
+  let execCodeSessions: ExecCodeSessionManager | null = null;
+  let speech: MacSpeechManager | null = null;
+  return {
+    id: "llm-space.built-in-tools",
+    register(tools) {
+      _assertDependencies(dependencies);
+      execCodeSessions = new ExecCodeSessionManager(dependencies.workspaceRoot);
+      tools.register({
+        id: "llm-space.built-in-tools.web",
+        entries: createWebBuiltInTools(dependencies),
+      });
+      tools.register({
+        id: "llm-space.built-in-tools.file-system",
+        entries: createFsBuiltInTools(dependencies),
+      });
+      tools.register({
+        id: "llm-space.built-in-tools.media",
+        entries: createMediaBuiltInTools(dependencies),
+      });
+      if (process.platform === "darwin") {
+        speech = new MacSpeechManager();
+        tools.register({
+          id: "llm-space.built-in-tools.speech",
+          entries: createSpeechBuiltInTools(speech),
+        });
+      }
+      tools.register({
+        id: "llm-space.built-in-tools.misc",
+        entries: [
+          ...miscBuiltInTools,
+          ...calculatorBuiltInTools,
+          ...dateDifferenceBuiltInTools,
+          ...createExecCodeBuiltInTools(execCodeSessions),
+        ],
+      });
+    },
+    start() {
+      execCodeSessions?.start();
+      return () => {
+        speech?.shutdown();
+        return execCodeSessions?.shutdown();
+      };
+    },
+  };
+}
+
+function _assertDependencies(
+  dependencies: BuiltInToolsModuleDependencies
+): void {
+  if (!dependencies || typeof dependencies !== "object") {
+    throw new Error('Missing built-in tools dependency "dependencies".');
+  }
+  if (!dependencies.workspaceRoot) {
+    throw new Error('Missing built-in tools dependency "workspaceRoot".');
+  }
+  if (typeof dependencies.findSkill !== "function") {
+    throw new Error('Missing built-in tools dependency "findSkill".');
+  }
+  if (typeof dependencies.getSearchSettings !== "function") {
+    throw new Error('Missing built-in tools dependency "getSearchSettings".');
+  }
+  if (typeof dependencies.generateImage !== "function") {
+    throw new Error('Missing built-in tools dependency "generateImage".');
+  }
+  if (!dependencies.env || typeof dependencies.env !== "object") {
+    throw new Error('Missing built-in tools dependency "env".');
+  }
+}

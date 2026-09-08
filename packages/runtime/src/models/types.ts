@@ -1,0 +1,74 @@
+import type {
+  ArkImageGenerationConfig,
+  CustomModel,
+  ModelConfig,
+  ProviderProfile,
+} from "@llm-space/core";
+
+export type CustomProviderApi =
+  "anthropic-messages" | "openai-completions" | "openai-responses";
+
+export const DEFAULT_CUSTOM_PROVIDER_API: CustomProviderApi =
+  "openai-completions";
+
+/**
+ * A user-defined model added to a provider in `settings/models.json`. The
+ * manager fills in the `provider`/`baseUrl` from the owning provider at build
+ * time. Aliased to the browser-safe {@link CustomModel} so the renderer, RPC,
+ * and manager all agree on the shape.
+ */
+export type CustomModelConfig = CustomModel;
+
+export type ProviderProfileConfig = ProviderProfile;
+
+/** One provider entry in `settings/models.json`. */
+export interface ProviderConfig {
+  id: string;
+  /** User-facing name for a custom provider. Builtins use the shipped name. */
+  name?: string;
+  /** Whether this is a builtin provider shipped with the app. */
+  builtin?: boolean;
+  /** Connection profiles in creation order. Index 0 is the fixed default. */
+  profiles?: ProviderProfileConfig[];
+  /** @deprecated Legacy field migrated into the first profile on load. */
+  apiKey?: string;
+  /** @deprecated Legacy field migrated into the first profile on load. */
+  baseUrl?: string;
+  /** @deprecated Legacy field migrated into the first profile on load. */
+  headers?: Record<string, string>;
+  /** API compatibility mode for a custom provider. */
+  api?: CustomProviderApi;
+  /**
+   * A `@lobehub/icons` keyword overriding the brand icon shown for this
+   * provider. Absent means the icon is auto-resolved from the provider id/name.
+   */
+  icon?: string;
+  /**
+   * Model ids the user has disabled for this provider. Absent/empty means every
+   * model is enabled (the default).
+   */
+  disabledModels?: string[];
+  /**
+   * User-defined models added on top of a builtin provider's catalog. Their
+   * `provider`/`baseUrl` are filled in from the owning provider at build time.
+   */
+  models?: CustomModelConfig[];
+  /**
+   * Ids of the user-added models (mirrors `models`). Kept as an explicit list
+   * so these models can later be singled out for deletion.
+   */
+  customModels?: string[];
+  /** Native Ark image-model inventory; only valid on the builtin Ark provider. */
+  imageGeneration?: ArkImageGenerationConfig;
+}
+
+/** Shape of `settings/models.json`. */
+export interface ModelsConfig {
+  providers: ProviderConfig[];
+  /**
+   * The user's chosen default model. Used to resolve threads with no saved
+   * model (or a stale reference to a removed model). Absent means "automatic" —
+   * fall back to the first available model.
+   */
+  defaultModel?: ModelConfig;
+}

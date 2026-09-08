@@ -1,0 +1,480 @@
+import { readdirSync, readFileSync } from "node:fs";
+import path from "node:path";
+
+import {
+  DEFAULT_SKILLS_SETTINGS,
+  type DiscoveryPathConfig,
+  type SkillContent,
+  type SkillInfo,
+  type SkillsSettings,
+} from "@llm-space/core";
+import {
+  atomicWriteJsonFileSync,
+  expandHomePath,
+  getSettingsDir,
+  readJsonFileSync,
+} from "@llm-space/core/server";
+import matter from "gray-matter";
+import { isValidSkillName, validateSkillFrontmatter } from "skills-handler";
+import { z } from "zod";
+
+const SkillsSettingsFileSchema = z.object({
+  discoveryPaths: z
+    .array(
+      z.object({
+        path: z.string(),
+        hiddenSkills: z.array(z.string()).default([]),
+      })
+    )
+    .optional(),
+  pluginSkills: z
+    .record(
+      z.string(),
+      z.object({ hiddenSkills: z.array(z.string()).default([]) })
+    )
+    .optional(),
+});
+
+/**
+ * Owns `settings/skills.json`: the discovery folders backing the built-in Skill
+ * tool and, per folder, the skills the user has hidden. Mirrors
+ * `SearchSettingsManager`'s eager, synchronous load-and-seed pattern.
+ *
+ * A discovery folder is itself the skills directory — skills live directly under
+ * it as `<folder>/<name>/SKILL.md`. Discovery (`listSkills`) and single-skill
+ * reads (`readSkill`) parse `SKILL.md` frontmatter with gray-matter and validate
+ * it against the Agent Skills spec via `skills-handler`.
+ */
+export interface SkillsManagerOptions {
+  managedSkillsDir?: string;
+}
+
+export interface PluginSkillConflict {
+  pluginId: string;
+  path: string;
+  name: string;
+  conflictingPaths: string[];
+}
+
+export class SkillsManager {
+  private _settings: SkillsSettings;
+  private _pluginSkills: { pluginId: string; path: string }[] = [];
+
+  constructor(private readonly _options: SkillsManagerOptions = {}) {
+    this._settings = this._loadConfig();
+  }
+
+  getConfig(): SkillsSettings {
+    return this._clone(this._settings);
+  }
+
+  setPluginPaths(
+    paths: { pluginId: string; path: string }[]
+  ): PluginSkillConflict[] {
+    const userSkills = this._settings.discoveryPaths.flatMap((entry) =>
+      this.listSkills(entry.path).map((skill) => ({
+        name: skill.name,
+        path: skill.path,
+      }))
+    );
+    const candidates = paths.flatMap((item) => {
+      try {
+        const name = this.readSkill(item.path).frontmatters.name;
+        return typeof name === "string" && name ? [{ ...item, name }] : [];
+      } catch {
+        return [];
+      }
+    });
+    const counts = new Map<string, number>();
+    for (const item of candidates) {
+      counts.set(item.name, (counts.get(item.name) ?? 0) + 1);
+    }
+    const conflicts = candidates.flatMap((item) => {
+      const conflictingPaths = [
+        ...userSkills
+          .filter((skill) => skill.name === item.name)
+          .map((skill) => skill.path),
+        ...candidates
+          .filter(
+            (candidate) =>
+              candidate.name === item.name && candidate.path !== item.path
+          )
+          .map((candidate) => candidate.path),
+      ];
+      return conflictingPaths.length > 0 ? [{ ...item, conflictingPaths }] : [];
+    });
+    const userNames = new Set(userSkills.map((skill) => skill.name));
+    this._pluginSkills = candidates
+      .filter(
+        (item) => !userNames.has(item.name) && counts.get(item.name) === 1
+      )
+      .map(({ pluginId, path }) => ({ pluginId, path }));
+    return conflicts;
+  }
+
+  /** Append a folder (trimmed, de-duplicated) with an empty hidden list. */
+  addPath(inputPath: string): SkillsSettings {
+    const p = inputPath.trim();
+    if (p === "") {
+      return this.getConfig();
+    }
+    if (!this._settings.discoveryPaths.some((entry) => entry.path === p)) {
+      this._settings.discoveryPaths.push({ path: p, hiddenSkills: [] });
+      this._saveConfig();
+    }
+    return this.getConfig();
+  }
+
+  removePath(inputPath: string): SkillsSettings {
+    const next = this._settings.discoveryPaths.filter(
+      (entry) => entry.path !== inputPath
+    );
+    if (next.length !== this._settings.discoveryPaths.length) {
+      this._settings.discoveryPaths = next;
+      this._saveConfig();
+    }
+    return this.getConfig();
+  }
+
+  /** Toggle a skill's visibility within one discovery folder. */
+  setSkillHidden(
+    inputPath: string,
+    skillName: string,
+    hidden: boolean
+  ): SkillsSettings {
+    const entry = this._settings.discoveryPaths.find(
+      (e) => e.path === inputPath
+    );
+    if (!entry) {
+      return this.getConfig();
+    }
+    const has = entry.hiddenSkills.includes(skillName);
+    if (hidden && !has) {
+      entry.hiddenSkills.push(skillName);
+      this._saveConfig();
+    } else if (!hidden && has) {
+      entry.hiddenSkills = entry.hiddenSkills.filter((n) => n !== skillName);
+      this._saveConfig();
+    }
+    return this.getConfig();
+  }
+
+  /** Toggle one Plugin Skill without modifying the Plugin directory. */
+  setPluginSkillHidden(
+    pluginId: string,
+    skillName: string,
+    hidden: boolean
+  ): SkillsSettings {
+    const exists = this._pluginSkills.some((item) => {
+      if (item.pluginId !== pluginId) return false;
+      try {
+        return this.readSkill(item.path).frontmatters.name === skillName;
+      } catch {
+        return false;
+      }
+    });
+    if (!exists) return this.getConfig();
+
+    const pluginSkills = (this._settings.pluginSkills ??= {});
+    const entry = (pluginSkills[pluginId] ??= {
+      hiddenSkills: [],
+    });
+    const has = entry.hiddenSkills.includes(skillName);
+    if (hidden && !has) {
+      entry.hiddenSkills.push(skillName);
+      this._saveConfig();
+    } else if (!hidden && has) {
+      entry.hiddenSkills = entry.hiddenSkills.filter(
+        (name) => name !== skillName
+      );
+      this._saveConfig();
+    }
+    return this.getConfig();
+  }
+
+  /** Enable or disable every Skill from one currently active Plugin. */
+  setAllPluginSkillsHidden(pluginId: string, hidden: boolean): SkillsSettings {
+    const names = this.listPluginSkills()
+      .filter((skill) => skill.pluginId === pluginId)
+      .map((skill) => skill.name);
+    if (names.length === 0) return this.getConfig();
+
+    const pluginSkills = (this._settings.pluginSkills ??= {});
+    const entry = (pluginSkills[pluginId] ??= { hiddenSkills: [] });
+    entry.hiddenSkills = hidden ? names : [];
+    this._saveConfig();
+    return this.getConfig();
+  }
+
+  /**
+   * Enable or disable every skill in one folder at once. Enabling clears the
+   * folder's `hiddenSkills`; disabling hides every skill currently discovered
+   * under it.
+   */
+  setAllSkillsHidden(inputPath: string, hidden: boolean): SkillsSettings {
+    const entry = this._settings.discoveryPaths.find(
+      (e) => e.path === inputPath
+    );
+    if (!entry) {
+      return this.getConfig();
+    }
+    entry.hiddenSkills = hidden
+      ? this.listSkills(inputPath).map((skill) => skill.name)
+      : [];
+    this._saveConfig();
+    return this.getConfig();
+  }
+
+  /**
+   * List the skills discovered under one folder. Each subdirectory holding a
+   * valid `SKILL.md` becomes one entry; `enabled` reflects the folder's
+   * `hiddenSkills`. Passing `enabledOnly` drops the hidden ones (for the runtime
+   * Skill tool). A missing or unreadable folder yields `[]`.
+   */
+  listSkills(
+    inputPath: string,
+    opts: { enabledOnly?: boolean } = {}
+  ): SkillInfo[] {
+    const entry = this._settings.discoveryPaths.find(
+      (e) => e.path === inputPath
+    );
+    const hidden = new Set(entry?.hiddenSkills ?? []);
+    const dir = expandHomePath(inputPath);
+
+    let dirents: import("node:fs").Dirent[];
+    try {
+      dirents = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+
+    const skills: SkillInfo[] = [];
+    for (const dirent of dirents) {
+      // Accept real directories and symlinks (skill folders are often
+      // symlinked). A symlink to a non-skill target is skipped below when its
+      // `SKILL.md` fails to read.
+      if (
+        (!dirent.isDirectory() && !dirent.isSymbolicLink()) ||
+        !isValidSkillName(dirent.name)
+      ) {
+        continue;
+      }
+      const skillDir = path.join(dir, dirent.name);
+      let data: unknown;
+      try {
+        const raw = readFileSync(path.join(skillDir, "SKILL.md"), "utf8");
+        data = matter(raw).data;
+      } catch {
+        // No SKILL.md (or unreadable) — not a skill directory.
+        continue;
+      }
+      if (!validateSkillFrontmatter(data)) {
+        continue;
+      }
+      const enabled = !hidden.has(data.name);
+      if (opts.enabledOnly && !enabled) {
+        continue;
+      }
+      skills.push({
+        name: data.name,
+        description: data.description,
+        path: skillDir,
+        enabled,
+      });
+    }
+
+    skills.sort((a, b) => a.name.localeCompare(b.name));
+    return skills;
+  }
+
+  /** List every conflict-free Skill contributed by currently active Plugins. */
+  listPluginSkills(): SkillInfo[] {
+    const skills: SkillInfo[] = [];
+    for (const item of this._pluginSkills) {
+      try {
+        const content = this.readSkill(item.path);
+        const name = content.frontmatters.name;
+        const description = content.frontmatters.description;
+        if (typeof name !== "string" || typeof description !== "string") {
+          continue;
+        }
+        const hidden = new Set(
+          this._settings.pluginSkills?.[item.pluginId]?.hiddenSkills ?? []
+        );
+        skills.push({
+          name,
+          description,
+          path: item.path,
+          enabled: !hidden.has(name),
+          source: "plugin",
+          readOnly: true,
+          pluginId: item.pluginId,
+        });
+      } catch {
+        // Invalid plugin skills are excluded without affecting other skills.
+      }
+    }
+    return skills.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** List the enabled, conflict-free skills available to agents. */
+  listAvailableSkills(): SkillInfo[] {
+    const byName = new Map<string, SkillInfo>();
+    for (const entry of this._settings.discoveryPaths) {
+      for (const skill of this.listSkills(entry.path, { enabledOnly: true })) {
+        if (!byName.has(skill.name)) {
+          byName.set(skill.name, { ...skill, source: "user", readOnly: false });
+        }
+      }
+    }
+    for (const skill of this.listPluginSkills()) {
+      if (skill.enabled && !byName.has(skill.name)) {
+        byName.set(skill.name, skill);
+      }
+    }
+    return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /**
+   * Resolve a skill by name across all discovery folders, returning its full
+   * content, or `null` when no folder holds a matching skill. Folders are
+   * searched in order; the first match wins. By default only enabled skills are
+   * considered — the runtime Skill tool must not load hidden ones.
+   */
+  findSkill(
+    name: string,
+    opts: { enabledOnly?: boolean } = { enabledOnly: true }
+  ): SkillContent | null {
+    for (const entry of this._settings.discoveryPaths) {
+      const match = this.listSkills(entry.path, opts).find(
+        (skill) => skill.name === name
+      );
+      if (match) {
+        return this.readSkill(match.path);
+      }
+    }
+    for (const item of this._pluginSkills) {
+      const hidden = new Set(
+        this._settings.pluginSkills?.[item.pluginId]?.hiddenSkills ?? []
+      );
+      try {
+        const content = this.readSkill(item.path);
+        if (
+          content.frontmatters.name === name &&
+          (opts.enabledOnly === false || !hidden.has(name))
+        ) {
+          return content;
+        }
+      } catch {
+        // Invalid plugin skills are excluded without affecting other skills.
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Read one skill's full `SKILL.md`: all frontmatter fields plus the markdown
+   * body. `skillDir` is an absolute skill directory path (as returned by
+   * `listSkills`).
+   */
+  readSkill(skillDir: string): SkillContent {
+    const raw = readFileSync(path.join(skillDir, "SKILL.md"), "utf8");
+    const parsed = matter(raw);
+    return {
+      frontmatters: parsed.data,
+      content: parsed.content,
+      path: skillDir,
+    };
+  }
+
+  private _clone(settings: SkillsSettings): SkillsSettings {
+    return {
+      discoveryPaths: settings.discoveryPaths.map((entry) => ({
+        path: entry.path,
+        hiddenSkills: [...entry.hiddenSkills],
+      })),
+      pluginSkills: Object.fromEntries(
+        Object.entries(settings.pluginSkills ?? {}).map(([pluginId, entry]) => [
+          pluginId,
+          { hiddenSkills: [...entry.hiddenSkills] },
+        ])
+      ),
+    };
+  }
+
+  /**
+   * The seeded defaults: the shared browser-safe folders plus the
+   * llm-space-managed `<root>/skills` folder (whose absolute path is only
+   * resolvable here, in the bun process).
+   */
+  private _defaultSettings(): SkillsSettings {
+    const settings = this._clone(DEFAULT_SKILLS_SETTINGS);
+    const managed = this._options.managedSkillsDir;
+    if (
+      managed &&
+      !settings.discoveryPaths.some((entry) => entry.path === managed)
+    ) {
+      settings.discoveryPaths.push({ path: managed, hiddenSkills: [] });
+    }
+    return settings;
+  }
+
+  private get _configPath(): string {
+    return path.join(getSettingsDir(), "skills.json");
+  }
+
+  private _saveConfig(): void {
+    atomicWriteJsonFileSync(this._configPath, this._settings);
+  }
+
+  /**
+   * Read `settings/skills.json`, normalizing against defaults so partial or
+   * missing files stay valid. Seeds the default config on disk when absent.
+   */
+  private _loadConfig(): SkillsSettings {
+    const result = readJsonFileSync(this._configPath, {
+      schema: SkillsSettingsFileSchema,
+      recovery: "best-effort",
+      fallback: () => this._defaultSettings(),
+      seedMissing: true,
+    });
+    return this._normalize(result.value);
+  }
+
+  private _normalize(input: Partial<SkillsSettings>): SkillsSettings {
+    if (!Array.isArray(input.discoveryPaths)) {
+      return this._defaultSettings();
+    }
+    const seen = new Set<string>();
+    const discoveryPaths: DiscoveryPathConfig[] = [];
+    for (const entry of input.discoveryPaths) {
+      const p = typeof entry?.path === "string" ? entry.path.trim() : "";
+      if (p === "" || seen.has(p)) {
+        continue;
+      }
+      seen.add(p);
+      const hiddenSkills = Array.isArray(entry?.hiddenSkills)
+        ? entry.hiddenSkills.filter(
+            (name): name is string => typeof name === "string"
+          )
+        : [];
+      discoveryPaths.push({ path: p, hiddenSkills });
+    }
+    const pluginSkills = Object.fromEntries(
+      Object.entries(input.pluginSkills ?? {}).flatMap(([pluginId, entry]) => {
+        if (!pluginId || !Array.isArray(entry?.hiddenSkills)) return [];
+        return [
+          [
+            pluginId,
+            {
+              hiddenSkills: entry.hiddenSkills.filter(
+                (name): name is string => typeof name === "string"
+              ),
+            },
+          ],
+        ];
+      })
+    );
+    return { discoveryPaths, pluginSkills };
+  }
+}
